@@ -1,10 +1,11 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Dict, List, Literal
 from engine import run_simulation
+from energetics import EnergeticsDatabaseError, load_energy_records, resolve_energy_inputs
 
-VERSION = "0.3-two-alloy-reduced-energy"
+VERSION = "0.4-paper-energy-database"
 
 app = FastAPI(title="IDOMS Two-Alloy Backend", version=VERSION)
 
@@ -43,14 +44,42 @@ class ToolSetup(BaseModel):
 
 class SimulationInput(BaseModel):
     setup: ToolSetup
-    energies_eV: Dict[str, float]
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": VERSION}
+    try:
+        record_count = len(load_energy_records())
+        database_status = "ready"
+    except EnergeticsDatabaseError:
+        record_count = 0
+        database_status = "unavailable"
+    return {"status": "ok" if database_status == "ready" else "degraded",
+            "version": VERSION,
+            "energetics_database": "IDOMS_Master_Energetics_Database.xlsx",
+            "energetics_database_status": database_status,
+            "energy_record_count": record_count}
+
+@app.post("/resolve-energies")
+def resolve_energies(inp: SimulationInput):
+    try:
+        return resolve_energy_inputs(inp.setup.model_dump())
+    except EnergeticsDatabaseError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 @app.post("/simulate")
 def simulate(inp: SimulationInput):
     if len(inp.setup.alloying_elements) > 2:
-        return {"error": "This version supports at most two alloying elements."}
-    return run_simulation(inp.setup.model_dump(), inp.energies_eV)
+        raise HTTPException(status_code=422, detail="This version supports at most two alloying elements.")
+    setup = inp.setup.model_dump()
+    try:
+        resolution = resolve_energy_inputs(setup)
+    except EnergeticsDatabaseError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if not resolution["runnable"]:
+        raise HTTPException(status_code=422, detail={
+            "message": "Required paper-supported energy values are missing; simulation was not run.",
+            "energy_resolution": resolution,
+        })
+    result = run_simulation(setup, resolution["resolved_energies_eV"])
+    result["energy_resolution"] = resolution
+    return result

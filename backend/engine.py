@@ -167,8 +167,8 @@ def compute_fields(sites, mids, solutes, energies, a):
         tree = cKDTree(pts)
         ds, _ = tree.query(sites, k=1)
         dm, _ = tree.query(mids, k=1)
-        dU = float(energies.get(f"{el}_site_energy_shift", 0.0))
-        dE = float(energies.get(f"{el}_saddle_energy_shift", 0.0))
+        dU = float(energies[f"{el}_site_energy_shift"])
+        dE = float(energies[f"{el}_saddle_energy_shift"])
         if dU:
             U += dU * np.exp(-(ds / R) ** 2)
         if dE:
@@ -181,7 +181,7 @@ def compute_fields(sites, mids, solutes, energies, a):
 def build_system(sites, edges, mids, U, Sshift, setup, energies):
     n = len(sites); T = float(setup["temperature_K"]); kBT = max(KB_EV * T, 1e-30)
     a = float(setup["lattice_parameter_A"])
-    E0 = float(energies.get("host_migration_barrier", 0.1))
+    E0 = float(energies["host_migration_barrier"])
     rows = []; cols = []; vals = []; adjacency = [[] for _ in range(n)]
     edge_act = np.zeros(len(edges))
     for e in range(len(edges)):
@@ -364,6 +364,17 @@ def json_safe(obj):
 def run_simulation(setup: Dict[str, Any], energies_eV: Dict[str, float]) -> Dict[str, Any]:
     if len(setup.get("alloying_elements", [])) > 2:
         raise ValueError("This backend supports up to two alloying elements.")
+    required_energy_keys = {"host_migration_barrier"}
+    for element in setup.get("alloying_elements", []):
+        required_energy_keys.add(f"{element}_site_energy_shift")
+        required_energy_keys.add(f"{element}_saddle_energy_shift")
+    missing_energy_keys = sorted(required_energy_keys.difference(energies_eV))
+    if missing_energy_keys:
+        raise ValueError("Missing required resolved energy values: " + ", ".join(missing_energy_keys))
+    invalid_energy_keys = [key for key in required_energy_keys
+                           if not math.isfinite(float(energies_eV[key]))]
+    if invalid_energy_keys:
+        raise ValueError("Energy values must be finite: " + ", ".join(sorted(invalid_energy_keys)))
 
     nx, ny, nz = int(setup["domain"]["Nx"]), int(setup["domain"]["Ny"]), int(setup["domain"]["Nz"])
     a = float(setup["lattice_parameter_A"]); crystal = setup["crystal_structure"]
@@ -375,7 +386,7 @@ def run_simulation(setup: Dict[str, Any], energies_eV: Dict[str, float]) -> Dict
     edges, mids, lengths = build_edges(sites)
     solutes = place_solutes(host, octa, setup)
 
-    E0 = float(energies_eV.get("host_migration_barrier", 0.1))
+    E0 = float(energies_eV["host_migration_barrier"])
 
     # --- alloy calculation ---
     U, Sshift = compute_fields(sites, mids, solutes, energies_eV, a)
@@ -385,7 +396,7 @@ def run_simulation(setup: Dict[str, Any], energies_eV: Dict[str, float]) -> Dict
     times, S, S_map = survival_outputs(system, start, fp["mfpt"])
 
     # --- ideal-host reference (retention) ---
-    U_h, S_h = compute_fields(sites, mids, solutes, {"host_migration_barrier": E0}, a)
+    U_h, S_h = compute_fields(sites, mids, {}, {"host_migration_barrier": E0}, a)
     system_h = build_system(sites, edges, mids, U_h, S_h, setup, {"host_migration_barrier": E0})
     mfpt_host = solve_mfpt(system_h, start)
     retention = float(fp["mfpt"] / mfpt_host) if mfpt_host > 0 else 1.0

@@ -1,21 +1,16 @@
-const DEFAULT_BACKEND_URL = "https://idoms-backend.onrender.com";
+const DEFAULT_BACKEND_URL = ["localhost", "127.0.0.1"].includes(window.location.hostname)
+  ? "http://localhost:8001"
+  : "https://idoms-backend.onrender.com";
 const MAX_ALLOY_ELEMENTS = 2;
 const MIN_ATOMS_PER_ALLOY = 4;
 const MIN_NX_NY = 5;
 const MIN_NZ = 8;
 
-// Literature-anchored default energy shifts (eV) used by the validation case,
-// so the tool's defaults reproduce the worked example exactly.
-const DEFAULT_SHIFTS = {
-  C:  {site: -0.090, saddle: 0.070},
-  Cr: {site:  0.025, saddle: 0.007}
-};
-
 const INFERNO = "Inferno";
 const TEAL = "#0f766e";
 
 let latestSetup = null;
-let latestEnergyTemplate = [];
+let latestEnergyResolution = null;
 let latestResult = null;
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -26,9 +21,13 @@ document.addEventListener("DOMContentLoaded", () => {
       showView(link.dataset.view);
     });
   });
-  // default composition
-  addCompositionRow("C", 1.0);
-  addCompositionRow("Cr", 9.0);
+  document.getElementById("hostElement")?.addEventListener("change", onHostChanged);
+  document.getElementById("interstitialSpecies")?.addEventListener("change", updateVacancyAvailability);
+  // Start with the paper-supported pure BCC Fe–H baseline. Alloying elements
+  // can be added; unsupported energy combinations will be shown as missing.
+  updateAlloyingElementOptions();
+  updateLatticeParameter();
+  updateVacancyAvailability();
   updateCompositionSummary();
   updateAddButtonState();
 });
@@ -58,7 +57,7 @@ async function checkBackend() {
   try {
     const r = await fetch(`${apiBase()}/health`);
     const j = await r.json();
-    status.textContent = `Backend status: ${j.status}. Version: ${j.version || "unknown"}`;
+    status.textContent = `Backend status: ${j.status}. Version: ${j.version || "unknown"}. Paper database: ${j.energetics_database_status || "unavailable"} (${j.energy_record_count || 0} records).`;
   } catch (err) {
     status.textContent = `Backend check failed: ${err.message}`;
   }
@@ -68,27 +67,72 @@ function updateAddButtonState() {
   const btn = document.getElementById("addAlloyBtn");
   if (!btn) return;
   const rows = document.querySelectorAll("#compositionRows tr").length;
-  btn.style.display = rows >= MAX_ALLOY_ELEMENTS ? "none" : "";
+  btn.style.display = rows >= Math.min(MAX_ALLOY_ELEMENTS, availableAlloyingElements().length) ? "none" : "";
+}
+
+function availableAlloyingElements() {
+  const host = document.getElementById("hostElement")?.value || "Fe";
+  return host === "Fe" ? ["C", "Cr"] : [];
+}
+
+function updateAlloyingElementOptions() {
+  const rows = [...document.querySelectorAll("#compositionRows tr")];
+  const allowed = availableAlloyingElements();
+  const chosen = rows.map(row => row.querySelector(".el-symbol")?.value || "").filter(Boolean);
+  rows.forEach((row, index) => {
+    const select = row.querySelector(".el-symbol");
+    const current = select.value;
+    const occupied = new Set(chosen.filter((el, i) => i !== index));
+    select.innerHTML = '<option value="">Select element</option>' +
+      allowed.filter(el => !occupied.has(el) || el === current).map(el => `<option value="${el}">${el}</option>`).join("");
+    select.value = current;
+  });
+  updateAddButtonState();
+}
+
+function onHostChanged() {
+  document.getElementById("compositionRows").innerHTML = "";
+  updateAlloyingElementOptions();
+  updateLatticeParameter();
+  updateVacancyAvailability();
+  updateCompositionSummary();
+}
+
+function handleCompositionChange() {
+  updateAlloyingElementOptions();
+  updateLatticeParameter();
+  updateCompositionSummary();
 }
 
 function addCompositionRow(element = "", atpct = "") {
   const tbody = document.getElementById("compositionRows");
-  if (tbody.children.length >= MAX_ALLOY_ELEMENTS) {
+  if (tbody.children.length >= Math.min(MAX_ALLOY_ELEMENTS, availableAlloyingElements().length)) {
     updateAddButtonState();
     return;
   }
   const tr = document.createElement("tr");
+  const available = availableAlloyingElements();
+  const chosen = new Set([...tbody.querySelectorAll(".el-symbol")].map(select => select.value).filter(Boolean));
+  const options = available.filter(el => !chosen.has(el) || el === element);
   tr.innerHTML = `
-    <td><input class="el-symbol" value="${element}" placeholder="e.g. Cr" oninput="updateCompositionSummary()" /></td>
+    <td><select class="el-symbol" onchange="handleCompositionChange()"><option value="">Select element</option>${options.map(el => `<option value="${el}">${el}</option>`).join("")}</select></td>
     <td><input class="el-atpct" type="number" min="0" max="100" step="0.001" value="${atpct}" oninput="updateCompositionSummary()" /></td>
     <td><button class="remove-btn" onclick="removeRow(this)">Remove</button></td>`;
   tbody.appendChild(tr);
+  tr.querySelector(".el-symbol").value = element;
+  tr.querySelector(".el-atpct").addEventListener("input", () => {
+    updateLatticeParameter();
+    updateCompositionSummary();
+  });
   updateCompositionSummary();
+  updateLatticeParameter();
   updateAddButtonState();
 }
 
 function removeRow(btn) {
   btn.closest("tr").remove();
+  updateAlloyingElementOptions();
+  updateLatticeParameter();
   updateCompositionSummary();
   updateAddButtonState();
 }
@@ -104,6 +148,46 @@ function getComposition() {
   return comp;
 }
 
+function paperLatticeParameter(host, composition) {
+  if (host === "Fe") {
+    const unsupported = Object.keys(composition).some(el => el !== "Cr");
+    if (unsupported) return {value: null, reason: "MISSING: the supplied papers do not give a lattice-parameter rule for C-containing Fe alloys."};
+    const crPct = Number(composition.Cr || 0);
+    const value = 2.83 + (crPct / 100) * (2.84 - 2.83);
+    return {value, reason: "S3: binary Fe–Cr interpolation from pure Fe (2.83 Å) and pure Cr (2.84 Å). The paper reports endpoints to 0.01 Å; finer displayed decimals are arithmetic interpolation only."};
+  }
+  if (host === "W" && Object.keys(composition).length === 0) {
+    const vacancyCount = Number(document.getElementById("vacancyConfiguration")?.value || 0);
+    return vacancyCount > 0
+      ? {value: 3.165, reason: "S7: experimental W lattice parameter used in the vacancy calculations."}
+      : {value: 3.172, reason: "S4: calculated lattice constant for pristine W (Table I). The paper gives 3.165 Å as the experimental comparator."};
+  }
+  return {value: null, reason: "MISSING: no matching paper-sourced lattice parameter is available for this composition."};
+}
+
+function updateLatticeParameter() {
+  const input = document.getElementById("latticeA");
+  if (!input) return;
+  const host = document.getElementById("hostElement")?.value || "Fe";
+  const resolved = paperLatticeParameter(host, getComposition());
+  input.value = resolved.value === null ? "" : resolved.value.toFixed(4);
+  const status = document.getElementById("latticeStatus");
+  if (status) status.textContent = resolved.reason;
+}
+
+function updateVacancyAvailability() {
+  updateLatticeParameter();
+  const host = document.getElementById("hostElement")?.value || "Fe";
+  const species = document.getElementById("interstitialSpecies")?.value || "H";
+  const status = document.getElementById("vacancyStatus");
+  if (!status) return;
+  if (host === "W" && species === "H") {
+    status.textContent = "Supported case: one fixed BCC W monovacancy trapping one dilute mobile H atom. Vacancy concentration effects, multi-H occupancy, and vacancy clusters are not simulated.";
+  } else {
+    status.textContent = "The kinetic vacancy model is available only for BCC W–H. Fe vacancy binding is in the database, but the supplied Fe paper does not report the matching transition barriers.";
+  }
+}
+
 function updateCompositionSummary() {
   const comp = getComposition();
   const totalAlloy = Object.values(comp).reduce((a, b) => a + b, 0);
@@ -116,7 +200,7 @@ function updateCompositionSummary() {
     return;
   }
   box.textContent =
-    `Alloying elements: ${Object.keys(comp).length} / ${MAX_ALLOY_ELEMENTS}\n` +
+    `Alloying elements: ${Object.keys(comp).length} / ${Math.min(MAX_ALLOY_ELEMENTS, availableAlloyingElements().length)} available for ${host}\n` +
     `Total alloying content: ${totalAlloy.toFixed(3)} at.%\n` +
     `${host} content: ${hostPct.toFixed(3)} at.%`;
 }
@@ -129,13 +213,16 @@ function collectSetup() {
   if (!host) throw new Error("Please enter a host element.");
   if (alloyingElements.length > MAX_ALLOY_ELEMENTS) throw new Error("Maximum 2 alloying elements allowed.");
   if (totalAlloy >= 100) throw new Error("Total alloying content must be less than 100 at.%.");
-  const aAng = Number(document.getElementById("latticeA").value);
-  if (!(aAng > 0)) throw new Error("Please enter a valid lattice parameter in Å.");
+  const crystal = document.getElementById("crystalStructure").value;
+  const vacancyCount = Number(document.getElementById("vacancyConfiguration").value);
+  const lattice = paperLatticeParameter(host, composition);
+  updateLatticeParameter();
+  if (crystal !== "BCC" || !(lattice.value > 0)) throw new Error(lattice.reason);
+  const aAng = lattice.value;
   const temperatureK = Number(document.getElementById("temperatureK").value);
   if (!(temperatureK > 0)) throw new Error("Please enter a valid temperature in K.");
   const slabThicknessNm = Number(document.getElementById("slabThicknessNm").value);
   if (!(slabThicknessNm > 0)) throw new Error("Please enter a valid slab thickness in nm.");
-  const crystal = document.getElementById("crystalStructure").value;
   const sitePerCell = crystal === "BCC" ? 2 : 4;
   const domain = calculateEfficientDomain(composition, crystal, aAng, slabThicknessNm);
   return {
@@ -145,6 +232,7 @@ function collectSetup() {
     host_at_percent: 100 - totalAlloy,
     crystal_structure: crystal,
     lattice_parameter_A: aAng,
+    vacancy_count: vacancyCount,
     interstitial_species: document.getElementById("interstitialSpecies").value,
     site_network: document.getElementById("siteNetwork").value,
     temperature_K: temperatureK,
@@ -183,29 +271,10 @@ function calculateEfficientDomain(composition, crystal, aAng, slabThicknessNm) {
   };
 }
 
-// Reduced vital-energy set: host_migration_barrier + per-alloy {site,saddle} shifts.
-// Per-element defaults reproduce the worked validation example.
-function buildEnergyTemplate(setup) {
-  const I = setup.interstitial_species;
-  const host = setup.host;
-  const defaultBarrier = setup.crystal_structure === "BCC" && host === "Fe" && I === "H" ? 0.088 : 0.100;
-  const template = [
-    {key: "host_migration_barrier", label: `Baseline ${I} migration barrier in pure ${host}`, kind: "activation barrier", unit: "eV", default: defaultBarrier}
-  ];
-  for (const el of setup.alloying_elements) {
-    const d = DEFAULT_SHIFTS[el] || {site: 0.000, saddle: 0.000};
-    template.push(
-      {key: `${el}_site_energy_shift`, label: `Site-energy shift ΔU for ${I} near ${el} (negative = attractive/trapping)`, kind: "site energy", unit: "eV", default: d.site},
-      {key: `${el}_saddle_energy_shift`, label: `Saddle-energy shift ΔE‡ for ${I} jumps near ${el} (positive = local barrier)`, kind: "saddle energy", unit: "eV", default: d.saddle}
-    );
-  }
-  return template;
-}
-
 async function prepareEnergyInputs() {
   try {
     latestSetup = collectSetup();
-    latestEnergyTemplate = buildEnergyTemplate(latestSetup);
+    latestEnergyResolution = null;
     const d = latestSetup.domain;
     const L = d.physical_size_nm;
     const counts = Object.entries(d.estimated_atom_counts).map(([k, v]) => `${k}: ${v}`).join(", ");
@@ -213,49 +282,78 @@ async function prepareEnergyInputs() {
       `Calculated domain: ${d.Nx} × ${d.Ny} × ${d.Nz} ${d.unit}\n` +
       `Physical size: ${L.Lx.toFixed(3)} × ${L.Ly.toFixed(3)} × ${L.Lz.toFixed(3)} nm\n` +
       `Total lattice sites: ${d.total_lattice_sites}\n` +
-      `Estimated lattice-site counts: ${counts}\n\n` +
+      `Estimated lattice-site counts: ${counts}\n` +
+      `Vacancies included: ${latestSetup.vacancy_count ? "one isolated monovacancy" : "none"}\n` +
+      `Paper-sourced lattice parameter: ${latestSetup.lattice_parameter_A.toFixed(4)} Å\n\n` +
       `Nx, Ny and Nz are numbers of unit cells. Physical length is N × a.`;
-    renderEnergyFields(latestEnergyTemplate);
+    document.getElementById("runStatus").textContent = "Looking up paper-supported energy values...";
+    const response = await fetch(`${apiBase()}/resolve-energies`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({setup: latestSetup})
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail || data));
+    latestEnergyResolution = data;
+    renderEnergyFields(data);
+    document.getElementById("runStatus").textContent = data.runnable
+      ? "Paper-supported energy values are ready."
+      : "Simulation blocked: one or more required paper values are missing.";
   } catch (err) { alert(err.message); }
 }
 
-function renderEnergyFields(template) {
+function renderEnergyFields(resolution) {
   const container = document.getElementById("energyFields");
   container.innerHTML = "";
-  template.forEach(item => {
+  (resolution.values || []).forEach(item => {
     const row = document.createElement("div");
     row.className = "energy-row";
-    row.innerHTML = `
-      <div><label>${item.label}</label><span class="energy-type">${item.kind}</span><div class="energy-key">key: ${item.key}; unit: ${item.unit}</div></div>
-      <input class="energy-input" id="energy_${item.key}" type="number" step="0.001" value="${item.default}" />`;
+    const details = document.createElement("div");
+    const label = document.createElement("label");
+    label.textContent = item.key;
+    const status = document.createElement("span");
+    status.className = "energy-type";
+    status.textContent = item.status || "UNKNOWN";
+    const provenance = document.createElement("div");
+    provenance.className = "energy-key";
+    provenance.textContent = [item.source_id, item.doi, item.paper_location, item.verification].filter(Boolean).join(" · ")
+      || item.reported_value_or_wording || "No matching paper record.";
+    details.append(label, status, provenance);
+    const value = document.createElement("strong");
+    value.className = "energy-value";
+    value.textContent = item.value === null || item.value === undefined ? "MISSING" : `${formatValue(item.value)} ${item.unit || ""}`.trim();
+    row.append(details, value);
     container.appendChild(row);
   });
-}
-
-function collectEnergies() {
-  const energies = {};
-  for (const item of latestEnergyTemplate) {
-    const el = document.getElementById(`energy_${item.key}`);
-    if (!el) throw new Error(`Missing energy input: ${item.key}`);
-    const val = Number(el.value);
-    if (!Number.isFinite(val)) throw new Error(`Invalid energy value for ${item.key}`);
-    energies[item.key] = val;
+  if (resolution.missing?.length) {
+    const note = document.createElement("p");
+    note.className = "hint";
+    note.textContent = "Required paper values missing: " + resolution.missing.map(x => `${x.key} — ${x.reason}`).join("; ");
+    container.appendChild(note);
   }
-  return energies;
+  if (resolution.non_paper_model_rules?.length) {
+    const note = document.createElement("p");
+    note.className = "energy-key";
+    note.textContent = "Solver rules (not paper energy records): " + resolution.non_paper_model_rules.join(" ");
+    container.appendChild(note);
+  }
 }
 
 async function runSimulation() {
   try {
-    if (!latestSetup) await prepareEnergyInputs();
-    const energies = collectEnergies();
-    const payload = {setup: latestSetup, energies_eV: energies};
+    await prepareEnergyInputs();
+    if (!latestSetup || !latestEnergyResolution) return;
+    if (!latestEnergyResolution.runnable) {
+      document.getElementById("runStatus").textContent = "Simulation blocked: required paper values are missing.";
+      return;
+    }
+    const payload = {setup: latestSetup};
     document.getElementById("runStatus").textContent = "Running backend graph/KMC calculation...";
     const response = await fetch(`${apiBase()}/simulate`, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload)});
     if (!response.ok) throw new Error(`Backend error: ${await response.text()}`);
     latestResult = await response.json();
     if (latestResult && latestResult.error) throw new Error(latestResult.error);
     renderResults(latestResult);
-    document.getElementById("runStatus").textContent = "Simulation complete. Results are from backend graph/master-equation calculation using user-supplied energies.";
+    document.getElementById("runStatus").textContent = "Simulation complete using paper-database energy values.";
   } catch (err) {
     alert(err.message);
     document.getElementById("runStatus").textContent = "Simulation failed.";
@@ -300,6 +398,8 @@ function renderPathPlot(result) {
   if (result.lattice_points?.x?.length) traces.push({x: result.lattice_points.x, y: result.lattice_points.z, mode: "markers", type: "scatter", name: "host lattice", marker: {size: 4, color: "rgba(100,116,139,0.30)"}});
   if (result.interstitial_sites?.x?.length) traces.push({x: result.interstitial_sites.x, y: result.interstitial_sites.z, mode: "markers", type: "scatter", name: "interstitial sites", marker: {size: 3, color: "rgba(125,211,252,0.35)"}});
   if (result.trap_sites?.x?.length) traces.push({x: result.trap_sites.x, y: result.trap_sites.z, mode: "markers", type: "scatter", name: "trap sites (U<0)", marker: {size: 7, color: "rgba(168,85,247,0.50)", symbol: "circle"}});
+  if (result.vacancy_positions?.x?.length) traces.push({x: result.vacancy_positions.x, y: result.vacancy_positions.z, mode: "markers", type: "scatter", name: "W vacancies", marker: {size: 12, color: "#111827", symbol: "x", line: {width: 2}}});
+  if (result.vacancy_trap_points?.x?.length) traces.push({x: result.vacancy_trap_points.x, y: result.vacancy_trap_points.z, mode: "markers", type: "scatter", name: "H trap at vacancy", marker: {size: 10, color: "#a855f7", symbol: "diamond", line: {width: 1, color: "#111"}}});
   if (result.high_barrier_edges?.x?.length) traces.push({x: result.high_barrier_edges.x, y: result.high_barrier_edges.z, mode: "markers", type: "scatter", name: "high-barrier edges (top 5%)", marker: {size: 7, color: "rgba(220,38,38,0.65)", symbol: "x"}});
   const byEl = {};
   for (const s of result.solute_positions || []) {
@@ -393,6 +493,6 @@ function renderSurvivalMapPlot(result) {
   }, {responsive: true});
 }
 
-function downloadInputJson() { if (!latestSetup) { alert("Generate energy inputs first."); return; } downloadJson("idoms_input.json", {setup: latestSetup, energies_eV: latestEnergyTemplate.length ? collectEnergies() : {}}); }
+function downloadInputJson() { if (!latestSetup) { alert("Calculate the domain and resolve paper values first."); return; } downloadJson("idoms_input.json", {setup: latestSetup, energies_eV: latestEnergyResolution?.resolved_energies_eV || {}, energy_resolution: latestEnergyResolution}); }
 function downloadResultJson() { if (!latestResult) { alert("Run a simulation first."); return; } downloadJson("idoms_result.json", latestResult); }
 function downloadJson(filename, obj) { const blob = new Blob([JSON.stringify(obj, null, 2)], {type: "application/json"}); const url = URL.createObjectURL(blob); const a = document.createElement("a"); a.href = url; a.download = filename; a.click(); URL.revokeObjectURL(url); }

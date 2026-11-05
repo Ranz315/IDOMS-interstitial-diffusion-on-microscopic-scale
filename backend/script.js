@@ -1,4 +1,6 @@
-const DEFAULT_BACKEND_URL = "https://idoms-backend.onrender.com";
+const DEFAULT_BACKEND_URL = ["localhost", "127.0.0.1"].includes(window.location.hostname)
+  ? "http://localhost:8001"
+  : "https://idoms-backend.onrender.com";
 const MAX_ALLOY_ELEMENTS = 2;
 const MIN_ATOMS_PER_ALLOY = 4;
 const MIN_NX_NY = 5;
@@ -19,8 +21,13 @@ document.addEventListener("DOMContentLoaded", () => {
       showView(link.dataset.view);
     });
   });
+  document.getElementById("hostElement")?.addEventListener("change", onHostChanged);
+  document.getElementById("interstitialSpecies")?.addEventListener("change", updateVacancyAvailability);
   // Start with the paper-supported pure BCC Fe–H baseline. Alloying elements
   // can be added; unsupported energy combinations will be shown as missing.
+  updateAlloyingElementOptions();
+  updateLatticeParameter();
+  updateVacancyAvailability();
   updateCompositionSummary();
   updateAddButtonState();
 });
@@ -60,27 +67,72 @@ function updateAddButtonState() {
   const btn = document.getElementById("addAlloyBtn");
   if (!btn) return;
   const rows = document.querySelectorAll("#compositionRows tr").length;
-  btn.style.display = rows >= MAX_ALLOY_ELEMENTS ? "none" : "";
+  btn.style.display = rows >= Math.min(MAX_ALLOY_ELEMENTS, availableAlloyingElements().length) ? "none" : "";
+}
+
+function availableAlloyingElements() {
+  const host = document.getElementById("hostElement")?.value || "Fe";
+  return host === "Fe" ? ["C", "Cr"] : [];
+}
+
+function updateAlloyingElementOptions() {
+  const rows = [...document.querySelectorAll("#compositionRows tr")];
+  const allowed = availableAlloyingElements();
+  const chosen = rows.map(row => row.querySelector(".el-symbol")?.value || "").filter(Boolean);
+  rows.forEach((row, index) => {
+    const select = row.querySelector(".el-symbol");
+    const current = select.value;
+    const occupied = new Set(chosen.filter((el, i) => i !== index));
+    select.innerHTML = '<option value="">Select element</option>' +
+      allowed.filter(el => !occupied.has(el) || el === current).map(el => `<option value="${el}">${el}</option>`).join("");
+    select.value = current;
+  });
+  updateAddButtonState();
+}
+
+function onHostChanged() {
+  document.getElementById("compositionRows").innerHTML = "";
+  updateAlloyingElementOptions();
+  updateLatticeParameter();
+  updateVacancyAvailability();
+  updateCompositionSummary();
+}
+
+function handleCompositionChange() {
+  updateAlloyingElementOptions();
+  updateLatticeParameter();
+  updateCompositionSummary();
 }
 
 function addCompositionRow(element = "", atpct = "") {
   const tbody = document.getElementById("compositionRows");
-  if (tbody.children.length >= MAX_ALLOY_ELEMENTS) {
+  if (tbody.children.length >= Math.min(MAX_ALLOY_ELEMENTS, availableAlloyingElements().length)) {
     updateAddButtonState();
     return;
   }
   const tr = document.createElement("tr");
+  const available = availableAlloyingElements();
+  const chosen = new Set([...tbody.querySelectorAll(".el-symbol")].map(select => select.value).filter(Boolean));
+  const options = available.filter(el => !chosen.has(el) || el === element);
   tr.innerHTML = `
-    <td><input class="el-symbol" value="${element}" placeholder="e.g. Cr" oninput="updateCompositionSummary()" /></td>
+    <td><select class="el-symbol" onchange="handleCompositionChange()"><option value="">Select element</option>${options.map(el => `<option value="${el}">${el}</option>`).join("")}</select></td>
     <td><input class="el-atpct" type="number" min="0" max="100" step="0.001" value="${atpct}" oninput="updateCompositionSummary()" /></td>
     <td><button class="remove-btn" onclick="removeRow(this)">Remove</button></td>`;
   tbody.appendChild(tr);
+  tr.querySelector(".el-symbol").value = element;
+  tr.querySelector(".el-atpct").addEventListener("input", () => {
+    updateLatticeParameter();
+    updateCompositionSummary();
+  });
   updateCompositionSummary();
+  updateLatticeParameter();
   updateAddButtonState();
 }
 
 function removeRow(btn) {
   btn.closest("tr").remove();
+  updateAlloyingElementOptions();
+  updateLatticeParameter();
   updateCompositionSummary();
   updateAddButtonState();
 }
@@ -96,6 +148,46 @@ function getComposition() {
   return comp;
 }
 
+function paperLatticeParameter(host, composition) {
+  if (host === "Fe") {
+    const unsupported = Object.keys(composition).some(el => el !== "Cr");
+    if (unsupported) return {value: null, reason: "MISSING: the supplied papers do not give a lattice-parameter rule for C-containing Fe alloys."};
+    const crPct = Number(composition.Cr || 0);
+    const value = 2.83 + (crPct / 100) * (2.84 - 2.83);
+    return {value, reason: "S3: binary Fe–Cr interpolation from pure Fe (2.83 Å) and pure Cr (2.84 Å). The paper reports endpoints to 0.01 Å; finer displayed decimals are arithmetic interpolation only."};
+  }
+  if (host === "W" && Object.keys(composition).length === 0) {
+    const vacancyCount = Number(document.getElementById("vacancyConfiguration")?.value || 0);
+    return vacancyCount > 0
+      ? {value: 3.165, reason: "S7: experimental W lattice parameter used in the vacancy calculations."}
+      : {value: 3.172, reason: "S4: calculated lattice constant for pristine W (Table I). The paper gives 3.165 Å as the experimental comparator."};
+  }
+  return {value: null, reason: "MISSING: no matching paper-sourced lattice parameter is available for this composition."};
+}
+
+function updateLatticeParameter() {
+  const input = document.getElementById("latticeA");
+  if (!input) return;
+  const host = document.getElementById("hostElement")?.value || "Fe";
+  const resolved = paperLatticeParameter(host, getComposition());
+  input.value = resolved.value === null ? "" : resolved.value.toFixed(4);
+  const status = document.getElementById("latticeStatus");
+  if (status) status.textContent = resolved.reason;
+}
+
+function updateVacancyAvailability() {
+  updateLatticeParameter();
+  const host = document.getElementById("hostElement")?.value || "Fe";
+  const species = document.getElementById("interstitialSpecies")?.value || "H";
+  const status = document.getElementById("vacancyStatus");
+  if (!status) return;
+  if (host === "W" && species === "H") {
+    status.textContent = "Supported case: one fixed BCC W monovacancy trapping one dilute mobile H atom. Vacancy concentration effects, multi-H occupancy, and vacancy clusters are not simulated.";
+  } else {
+    status.textContent = "The kinetic vacancy model is available only for BCC W–H. Fe vacancy binding is in the database, but the supplied Fe paper does not report the matching transition barriers.";
+  }
+}
+
 function updateCompositionSummary() {
   const comp = getComposition();
   const totalAlloy = Object.values(comp).reduce((a, b) => a + b, 0);
@@ -108,7 +200,7 @@ function updateCompositionSummary() {
     return;
   }
   box.textContent =
-    `Alloying elements: ${Object.keys(comp).length} / ${MAX_ALLOY_ELEMENTS}\n` +
+    `Alloying elements: ${Object.keys(comp).length} / ${Math.min(MAX_ALLOY_ELEMENTS, availableAlloyingElements().length)} available for ${host}\n` +
     `Total alloying content: ${totalAlloy.toFixed(3)} at.%\n` +
     `${host} content: ${hostPct.toFixed(3)} at.%`;
 }
@@ -121,13 +213,16 @@ function collectSetup() {
   if (!host) throw new Error("Please enter a host element.");
   if (alloyingElements.length > MAX_ALLOY_ELEMENTS) throw new Error("Maximum 2 alloying elements allowed.");
   if (totalAlloy >= 100) throw new Error("Total alloying content must be less than 100 at.%.");
-  const aAng = Number(document.getElementById("latticeA").value);
-  if (!(aAng > 0)) throw new Error("Please enter a valid lattice parameter in Å.");
+  const crystal = document.getElementById("crystalStructure").value;
+  const vacancyCount = Number(document.getElementById("vacancyConfiguration").value);
+  const lattice = paperLatticeParameter(host, composition);
+  updateLatticeParameter();
+  if (crystal !== "BCC" || !(lattice.value > 0)) throw new Error(lattice.reason);
+  const aAng = lattice.value;
   const temperatureK = Number(document.getElementById("temperatureK").value);
   if (!(temperatureK > 0)) throw new Error("Please enter a valid temperature in K.");
   const slabThicknessNm = Number(document.getElementById("slabThicknessNm").value);
   if (!(slabThicknessNm > 0)) throw new Error("Please enter a valid slab thickness in nm.");
-  const crystal = document.getElementById("crystalStructure").value;
   const sitePerCell = crystal === "BCC" ? 2 : 4;
   const domain = calculateEfficientDomain(composition, crystal, aAng, slabThicknessNm);
   return {
@@ -137,6 +232,7 @@ function collectSetup() {
     host_at_percent: 100 - totalAlloy,
     crystal_structure: crystal,
     lattice_parameter_A: aAng,
+    vacancy_count: vacancyCount,
     interstitial_species: document.getElementById("interstitialSpecies").value,
     site_network: document.getElementById("siteNetwork").value,
     temperature_K: temperatureK,
@@ -186,7 +282,9 @@ async function prepareEnergyInputs() {
       `Calculated domain: ${d.Nx} × ${d.Ny} × ${d.Nz} ${d.unit}\n` +
       `Physical size: ${L.Lx.toFixed(3)} × ${L.Ly.toFixed(3)} × ${L.Lz.toFixed(3)} nm\n` +
       `Total lattice sites: ${d.total_lattice_sites}\n` +
-      `Estimated lattice-site counts: ${counts}\n\n` +
+      `Estimated lattice-site counts: ${counts}\n` +
+      `Vacancies included: ${latestSetup.vacancy_count ? "one isolated monovacancy" : "none"}\n` +
+      `Paper-sourced lattice parameter: ${latestSetup.lattice_parameter_A.toFixed(4)} Å\n\n` +
       `Nx, Ny and Nz are numbers of unit cells. Physical length is N × a.`;
     document.getElementById("runStatus").textContent = "Looking up paper-supported energy values...";
     const response = await fetch(`${apiBase()}/resolve-energies`, {
@@ -300,6 +398,8 @@ function renderPathPlot(result) {
   if (result.lattice_points?.x?.length) traces.push({x: result.lattice_points.x, y: result.lattice_points.z, mode: "markers", type: "scatter", name: "host lattice", marker: {size: 4, color: "rgba(100,116,139,0.30)"}});
   if (result.interstitial_sites?.x?.length) traces.push({x: result.interstitial_sites.x, y: result.interstitial_sites.z, mode: "markers", type: "scatter", name: "interstitial sites", marker: {size: 3, color: "rgba(125,211,252,0.35)"}});
   if (result.trap_sites?.x?.length) traces.push({x: result.trap_sites.x, y: result.trap_sites.z, mode: "markers", type: "scatter", name: "trap sites (U<0)", marker: {size: 7, color: "rgba(168,85,247,0.50)", symbol: "circle"}});
+  if (result.vacancy_positions?.x?.length) traces.push({x: result.vacancy_positions.x, y: result.vacancy_positions.z, mode: "markers", type: "scatter", name: "W vacancies", marker: {size: 12, color: "#111827", symbol: "x", line: {width: 2}}});
+  if (result.vacancy_trap_points?.x?.length) traces.push({x: result.vacancy_trap_points.x, y: result.vacancy_trap_points.z, mode: "markers", type: "scatter", name: "H trap at vacancy", marker: {size: 10, color: "#a855f7", symbol: "diamond", line: {width: 1, color: "#111"}}});
   if (result.high_barrier_edges?.x?.length) traces.push({x: result.high_barrier_edges.x, y: result.high_barrier_edges.z, mode: "markers", type: "scatter", name: "high-barrier edges (top 5%)", marker: {size: 7, color: "rgba(220,38,38,0.65)", symbol: "x"}});
   const byEl = {};
   for (const s of result.solute_positions || []) {

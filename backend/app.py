@@ -5,7 +5,7 @@ from typing import Dict, List, Literal
 from engine import run_simulation
 from energetics import EnergeticsDatabaseError, load_energy_records, resolve_energy_inputs
 
-VERSION = "0.4-paper-energy-database"
+VERSION = "0.5-paper-lattice-and-vacancy"
 
 app = FastAPI(title="IDOMS Two-Alloy Backend", version=VERSION)
 
@@ -34,6 +34,7 @@ class ToolSetup(BaseModel):
     host_at_percent: float
     crystal_structure: Literal["BCC", "FCC"]
     lattice_parameter_A: float
+    vacancy_count: Literal[0, 1] = 0
     interstitial_species: Literal["H", "D", "T", "C", "N", "O"]
     site_network: Literal["auto", "tetrahedral", "octahedral", "tetra_octa"] = "auto"
     temperature_K: float
@@ -80,6 +81,10 @@ def simulate(inp: SimulationInput):
             "message": "Required paper-supported energy values are missing; simulation was not run.",
             "energy_resolution": resolution,
         })
-    result = run_simulation(setup, resolution["resolved_energies_eV"])
+    setup["lattice_parameter_A"] = resolution["lattice_parameter_A"]
+    simulation_energies = dict(resolution["resolved_energies_eV"])
+    simulation_energies.update(resolution.get("resolved_vacancy_parameters", {}))
+    result = run_simulation(setup, simulation_energies)
+    result["paper_lattice_parameter_A"] = resolution["lattice_parameter_A"]
     result["energy_resolution"] = resolution
     return result

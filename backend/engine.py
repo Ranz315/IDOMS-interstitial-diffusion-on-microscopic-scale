@@ -178,26 +178,35 @@ def compute_fields(sites, mids, solutes, energies, a):
 # ---------------------------------------------------------------------------
 # Master-equation system
 # ---------------------------------------------------------------------------
-def build_system(sites, edges, mids, U, Sshift, setup, energies):
+def build_system(sites, edges, mids, U, Sshift, setup, energies,
+                 special_edge_rates=None, mobile_site_count=None):
     n = len(sites); T = float(setup["temperature_K"]); kBT = max(KB_EV * T, 1e-30)
     a = float(setup["lattice_parameter_A"])
     E0 = float(energies["host_migration_barrier"])
+    special_edge_rates = special_edge_rates or {}
     rows = []; cols = []; vals = []; adjacency = [[] for _ in range(n)]
     edge_act = np.zeros(len(edges))
     for e in range(len(edges)):
         i = int(edges[e, 0]); j = int(edges[e, 1])
-        saddle = max(U[i], U[j]) + E0 + Sshift[e]
-        Eij = max(saddle - U[i], E_MIN)
-        Eji = max(saddle - U[j], E_MIN)
-        kij = NU0 * math.exp(-Eij / kBT); kji = NU0 * math.exp(-Eji / kBT)
+        if e in special_edge_rates:
+            Eij, Eji, nu = special_edge_rates[e]
+        else:
+            saddle = max(U[i], U[j]) + E0 + Sshift[e]
+            Eij = max(saddle - U[i], E_MIN)
+            Eji = max(saddle - U[j], E_MIN)
+            nu = NU0
+        kij = nu * math.exp(-Eij / kBT); kji = nu * math.exp(-Eji / kBT)
         rows += [i, j]; cols += [j, i]; vals += [kij, kji]
         adjacency[i].append((j, kij, Eij, e)); adjacency[j].append((i, kji, Eji, e))
         edge_act[e] = 0.5 * (Eij + Eji)
     W = csr_matrix((vals, (rows, cols)), shape=(n, n))
     sum_jump = np.asarray(W.sum(axis=1)).ravel()
     z = sites[:, 2]; zmin, zmax = float(z.min()), float(z.max())
-    near_surface = z <= zmin + NEAR_BOUNDARY_A * a
-    near_bulk = z >= zmax - NEAR_BOUNDARY_A * a
+    boundary_site_count = n if mobile_site_count is None else int(mobile_site_count)
+    near_surface = (z <= zmin + NEAR_BOUNDARY_A * a)
+    near_bulk = (z >= zmax - NEAR_BOUNDARY_A * a)
+    near_surface[boundary_site_count:] = False
+    near_bulk[boundary_site_count:] = False
     E_surf = float(energies.get("surface_exit_barrier", E0))
     E_bulk = float(energies.get("bulk_exit_barrier", E0))
     k_surface = np.zeros(n); k_bulk = np.zeros(n)
@@ -214,7 +223,7 @@ def build_system(sites, edges, mids, U, Sshift, setup, energies):
 # ---------------------------------------------------------------------------
 # Transport
 # ---------------------------------------------------------------------------
-def source_distribution(sites, setup):
+def source_distribution(sites, setup, mobile_site_count=None):
     a = float(setup["lattice_parameter_A"])
     nx, ny, nz = setup["domain"]["Nx"], setup["domain"]["Ny"], setup["domain"]["Nz"]
     zf = SOURCE_Z_FRACTION.get(setup["boundary"], 0.23)
@@ -223,9 +232,72 @@ def source_distribution(sites, setup):
     dx2 = (sites[:, 0] - cx) ** 2 + (sites[:, 1] - cy) ** 2
     dz2 = (sites[:, 2] - cz) ** 2
     w = np.exp(-dx2 / sig_xy ** 2) * np.exp(-dz2 / sig_z ** 2)
+    if mobile_site_count is not None:
+        w[int(mobile_site_count):] = 0.0
     if not np.isfinite(w).all() or w.sum() <= 0:
         w = np.ones(len(sites))
     return w / w.sum()
+
+
+def place_vacancies(host_pts, setup):
+    count = int(setup.get("vacancy_count", 0) or 0)
+    if count <= 0 or len(host_pts) == 0:
+        return np.empty((0, 3), dtype=float)
+    if count != 1:
+        raise ValueError("The paper-supported vacancy model includes exactly one isolated monovacancy.")
+    nx, ny, nz = setup["domain"]["Nx"], setup["domain"]["Ny"], setup["domain"]["Nz"]
+    a = float(setup["lattice_parameter_A"])
+    center = np.asarray([0.5 * nx * a, 0.5 * ny * a, 0.5 * nz * a])
+    index = int(np.argmin(np.linalg.norm(host_pts - center, axis=1)))
+    return host_pts[index:index + 1]
+
+
+def add_w_vacancy_traps(base_sites, base_edges, base_mids, vacancy_positions,
+                        octa_sites, energies):
+    """Add the paper's single-H W monovacancy Oh trap and Td escape links."""
+    if len(vacancy_positions) == 0:
+        return base_sites, base_edges, base_mids, {}, np.empty((0, 3), dtype=float)
+
+    binding = float(energies["W_vacancy_H1_binding_eV"])
+    detrapping = float(energies["W_vacancy_H1_detrapping_barrier_eV"])
+    attempt = float(energies["W_vacancy_H1_attempt_frequency_Hz"])
+    capture = float(energies["W_vacancy_H1_capture_barrier_eV"])
+    if not all(math.isfinite(x) for x in (binding, detrapping, attempt, capture)):
+        raise ValueError("W vacancy parameters must be finite paper values.")
+    if capture <= 0 or detrapping <= 0 or attempt <= 0:
+        raise ValueError("W vacancy transitions require positive paper-supported barriers and attempt frequency.")
+
+    octa_tree = cKDTree(octa_sites)
+    tetra_tree = cKDTree(base_sites)
+    trap_positions = []
+    new_edges = []
+    edge_rates = {}
+    for vacancy in vacancy_positions:
+        _, octa_index = octa_tree.query(vacancy, k=1)
+        trap = octa_sites[int(octa_index)]
+        if any(np.linalg.norm(trap - old) < 1e-8 for old in trap_positions):
+            raise ValueError("Two vacancies map to the same paper-defined octahedral trap site; this overlapping configuration is unsupported.")
+        trap_positions.append(trap)
+        nearest_distance, _ = tetra_tree.query(trap, k=1)
+        neighbors = tetra_tree.query_ball_point(trap, float(nearest_distance) + 1e-8)
+        if not neighbors:
+            raise ValueError("No tetrahedral escape site was found for a W vacancy trap.")
+        trap_node = len(base_sites) + len(trap_positions) - 1
+        for tetra_index in sorted(neighbors):
+            new_edges.append((int(tetra_index), trap_node))
+
+    if trap_positions:
+        trap_positions_array = np.asarray(trap_positions, dtype=float)
+        sites = np.vstack([base_sites, trap_positions_array])
+        edges = np.vstack([base_edges, np.asarray(new_edges, dtype=int)])
+        new_mids = 0.5 * (sites[np.asarray(new_edges)[:, 0]] + sites[np.asarray(new_edges)[:, 1]])
+        mids = np.vstack([base_mids, new_mids])
+        # Edge orientation is tetrahedral site -> trap, followed by trap -> tetrahedral site.
+        first_special = len(base_edges)
+        for offset in range(len(new_edges)):
+            edge_rates[first_special + offset] = (capture, detrapping, attempt)
+        return sites, edges, mids, edge_rates, trap_positions_array
+    return base_sites, base_edges, base_mids, edge_rates, np.empty((0, 3), dtype=float)
 
 
 def solve_first_passage(system, start):
@@ -376,29 +448,61 @@ def run_simulation(setup: Dict[str, Any], energies_eV: Dict[str, float]) -> Dict
     if invalid_energy_keys:
         raise ValueError("Energy values must be finite: " + ", ".join(sorted(invalid_energy_keys)))
 
+    vacancy_count_requested = int(setup.get("vacancy_count", 0) or 0)
+    if vacancy_count_requested > 0:
+        if setup["host"] != "W" or setup["crystal_structure"] != "BCC" or setup["interstitial_species"] != "H":
+            raise ValueError("The implemented vacancy model is limited to BCC W-H.")
+        vacancy_keys = {"W_vacancy_H1_binding_eV", "W_vacancy_H1_detrapping_barrier_eV",
+                        "W_vacancy_H1_capture_barrier_eV", "W_vacancy_H1_attempt_frequency_Hz"}
+        absent = sorted(vacancy_keys.difference(energies_eV))
+        if absent:
+            raise ValueError("Missing paper-supported W vacancy values: " + ", ".join(absent))
+
     nx, ny, nz = int(setup["domain"]["Nx"]), int(setup["domain"]["Ny"]), int(setup["domain"]["Nz"])
     a = float(setup["lattice_parameter_A"]); crystal = setup["crystal_structure"]
     network = network_name(setup.get("site_network", "auto"), setup["interstitial_species"])
 
     host = host_lattice(crystal, nx, ny, nz, a)
-    sites = interstitial_network(crystal, network, nx, ny, nz, a)
+    base_sites = interstitial_network(crystal, network, nx, ny, nz, a)
     octa = octahedral_sites(crystal, nx, ny, nz, a)
-    edges, mids, lengths = build_edges(sites)
+    base_edges, base_mids, lengths = build_edges(base_sites)
     solutes = place_solutes(host, octa, setup)
+    vacancy_positions = place_vacancies(host, setup)
+    if len(vacancy_positions):
+        sites, edges, mids, special_edge_rates, vacancy_traps = add_w_vacancy_traps(
+            base_sites, base_edges, base_mids, vacancy_positions, octa, energies_eV
+        )
+        remaining = np.ones(len(host), dtype=bool)
+        host_tree = cKDTree(host)
+        _, removed = host_tree.query(vacancy_positions, k=1)
+        remaining[np.asarray(removed, dtype=int)] = False
+        host_visible = host[remaining]
+    else:
+        sites, edges, mids = base_sites, base_edges, base_mids
+        special_edge_rates = {}
+        vacancy_traps = np.empty((0, 3), dtype=float)
+        host_visible = host
 
     E0 = float(energies_eV["host_migration_barrier"])
 
     # --- alloy calculation ---
     U, Sshift = compute_fields(sites, mids, solutes, energies_eV, a)
-    system = build_system(sites, edges, mids, U, Sshift, setup, energies_eV)
-    start = source_distribution(sites, setup)
+    if len(vacancy_traps):
+        U[len(base_sites):] = float(energies_eV["W_vacancy_H1_binding_eV"])
+    system = build_system(sites, edges, mids, U, Sshift, setup, energies_eV,
+                          special_edge_rates=special_edge_rates,
+                          mobile_site_count=len(base_sites))
+    start = source_distribution(sites, setup, mobile_site_count=len(base_sites))
     fp = solve_first_passage(system, start)
     times, S, S_map = survival_outputs(system, start, fp["mfpt"])
 
     # --- ideal-host reference (retention) ---
-    U_h, S_h = compute_fields(sites, mids, {}, {"host_migration_barrier": E0}, a)
-    system_h = build_system(sites, edges, mids, U_h, S_h, setup, {"host_migration_barrier": E0})
-    mfpt_host = solve_mfpt(system_h, start)
+    U_h, S_h = compute_fields(base_sites, base_mids, {}, {"host_migration_barrier": E0}, a)
+    system_h = build_system(base_sites, base_edges, base_mids, U_h, S_h, setup,
+                            {"host_migration_barrier": E0},
+                            mobile_site_count=len(base_sites))
+    start_h = source_distribution(base_sites, setup)
+    mfpt_host = solve_mfpt(system_h, start_h)
     retention = float(fp["mfpt"] / mfpt_host) if mfpt_host > 0 else 1.0
 
     # --- dominant path (metrics) and full channel (visualisation) ---
@@ -429,8 +533,8 @@ def run_simulation(setup: Dict[str, Any], energies_eV: Dict[str, float]) -> Dict
     trap_frac = float(res[trap_metric_mask].sum() / total_res) if np.any(trap_metric_mask) else 0.0
 
     # --- visual filtering to a thin y-slice around the channel ---
-    fe_i = np.where(in_slice(host, y0, a, 0.55))[0]; fe_i = fe_i[thin_idx(len(fe_i), 700)]
-    hs_i = np.where(in_slice(sites, y0, a, 0.55))[0]; hs_i = hs_i[thin_idx(len(hs_i), 700)]
+    fe_i = np.where(in_slice(host_visible, y0, a, 0.55))[0]; fe_i = fe_i[thin_idx(len(fe_i), 700)]
+    hs_i = np.where(in_slice(base_sites, y0, a, 0.55))[0]; hs_i = hs_i[thin_idx(len(hs_i), 700)]
 
     trap_vis = U <= min(-1e-4, float(np.percentile(U, 10)))
     trap_i = np.where(trap_vis & in_slice(sites, y0, a, 0.9))[0]; trap_i = trap_i[thin_idx(len(trap_i), 350)]
@@ -468,8 +572,10 @@ def run_simulation(setup: Dict[str, Any], energies_eV: Dict[str, float]) -> Dict
         },
         "dominant_absorbing_boundary": target,
         # ---- plot (a): lattice-aware channel in a thin y-slice ----
-        "lattice_points": xz(host[fe_i], a),
+        "lattice_points": xz(host_visible[fe_i], a),
         "interstitial_sites": xz(sites[hs_i], a),
+        "vacancy_positions": xz(vacancy_positions[in_slice(vacancy_positions, y0, a, 0.9)], a),
+        "vacancy_trap_points": xz(vacancy_traps[in_slice(vacancy_traps, y0, a, 0.9)], a),
         "solute_positions": solute_out,
         "trap_sites": xz(sites[trap_i], a),
         "high_barrier_edges": xz(mids[high_i], a),
@@ -495,11 +601,18 @@ def run_simulation(setup: Dict[str, Any], energies_eV: Dict[str, float]) -> Dict
         "survival_map": survival_map,
         "domain": setup["domain"],
         "site_network_used": network,
+        "vacancy_configuration": {
+            "enabled": bool(len(vacancy_positions)),
+            "requested_vacancy_count": vacancy_count_requested,
+            "placed_vacancy_count": int(len(vacancy_positions)),
+            "model_scope": "One fixed BCC W monovacancy trapping one dilute mobile H atom; vacancy concentration, multiple H per vacancy, and vacancy motion are not modeled." if len(vacancy_positions) else "No vacancy states.",
+        },
         "notes": {
             "reproduces": "Ported from the IDOMS worked validation example; identical results for matching inputs.",
             "energy_definition": "E_act(i->j) = E_saddle(i,j) - U_i, with U_i the explicit diffusing-species site energy.",
             "channel": "Visualised pathway is the continuous minimum-resistance channel surface <-> injection <-> bulk.",
             "retention_definition": "Retention factor = tau_MFPT(alloy) / tau_MFPT(ideal host) on the same domain.",
+            "vacancy_model": ("One W monovacancy is placed at the host-lattice site nearest the simulation-cell center. The model traps one dilute mobile H atom and uses S7 DFT single-H binding, detrapping barrier, and attempt frequency. Vacancy concentration, multi-H occupancy, vacancy migration, and vacancy clusters are not modeled." if len(vacancy_positions) else "No vacancy sites were included."),
         },
     }
     return json_safe(result)

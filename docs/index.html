@@ -95,21 +95,24 @@
               trap-residence fraction.
             </p>
             <p>
-              The default worked example models hydrogen diffusion in BCC Fe–C–Cr. The baseline hydrogen migration
-              barrier in BCC Fe is taken as 0.088 eV from the first-principles work of Jiang and Carter [1]. The
-              hydrogen–carbon attractive site-energy shift is taken as approximately 0.09 eV from first-principles
-              hydrogen-trap energetics in α-Fe [2]. Chromium is included as a substitutional alloying element in the
-              Fe–Cr lattice field; in the minimal-input demonstration, direct H–Cr trapping is treated conservatively
-              as weak/repulsive rather than strongly attractive, consistent with first-principles Fe–Cr
-              hydrogen-transport studies [3]. The local C-associated saddle penalty is used as a transparent model input
-              to represent barrier distortion near carbon-rich environments and can be edited by the user.
+              Runtime energy values are resolved from the paper-sourced database in the backend. The supplied papers
+              provide a BCC Fe–H baseline barrier and an H–C binding value that can be explicitly mapped to the IDOMS
+              site-energy sign convention. They do not provide all required C/Cr local saddle and site shifts, so such
+              alloy configurations are reported as incomplete and are not simulated. The solver now includes a
+              single-H, fixed-monovacancy trap model for BCC W–H. Fe vacancy records remain reference-only because
+              the supplied Fe paper does not provide the transition barriers needed by the solver.
             </p>
             <div class="refs">
-              <span class="refs-title">References used for default values</span>
+              <span class="refs-title">Papers registered in the energy database</span>
               <ol>
                 <li>D. E. Jiang and E. A. Carter, <em>Diffusion of interstitial hydrogen into and through BCC Fe from first principles</em>, Physical Review B, 70, 064102, 2004.</li>
                 <li>W. A. Counts, C. Wolverton and R. Gibala, <em>First-principles energetics of hydrogen traps in α-Fe: Point defects</em>, Acta Materialia, 58, 4730–4741, 2010.</li>
                 <li>A. J. Samin, D. A. Andersson, E. F. Holby and B. P. Uberuaga, <em>First-principles localized cluster expansion study of the kinetics of hydrogen diffusion in homogeneous and heterogeneous Fe–Cr alloys</em>, Physical Review B, 99, 014110, 2019.</li>
+                <li>K. Heinola and T. Ahlgren, <em>Diffusion of hydrogen in bcc tungsten studied with first principle calculations</em>, Journal of Applied Physics, 107, 113531, 2010.</li>
+                <li>J. Xu and J. Zhao, <em>First-principles study of hydrogen in perfect tungsten crystal</em>, Nuclear Instruments and Methods in Physics Research B, 267, 3170–3174, 2009.</li>
+                <li>K. Ohsawa, J. Goto, M. Yamakami, M. Yamaguchi and M. Yagi, <em>Trapping of multiple hydrogen atoms in a tungsten monovacancy from first principles</em>, Physical Review B, 82, 184117, 2010.</li>
+                <li>N. Fernandez, Y. Ferro and D. Kato, <em>Hydrogen diffusion and vacancies formation in tungsten: Density Functional Theory calculations and statistical models</em>, Acta Materialia, 94, 307–318, 2015.</li>
+                <li>L.-F. Wang et al., <em>Molecular dynamics studies of hydrogen diffusion in tungsten at elevated temperature: Concentration dependence and defect effects</em>, International Journal of Hydrogen Energy, 45, 822–834, 2020. Numeric values are unavailable in the supplied HTML preview.</li>
               </ol>
             </div>
           </section>
@@ -117,16 +120,28 @@
           <section class="card">
             <h2>1. Alloy composition</h2>
             <div class="grid two">
-              <label>Host element <input id="hostElement" value="Fe" /></label>
-              <label>Lattice parameter, a (Å) <input id="latticeA" type="number" step="0.0001" value="2.866" /></label>
+              <label>Host element
+                <select id="hostElement"><option value="Fe">Fe (BCC iron)</option><option value="W">W (BCC tungsten)</option></select>
+              </label>
+              <label>Paper-sourced lattice parameter, a (Å) <input id="latticeA" type="number" step="0.0001" readonly /></label>
             </div>
-            <p class="hint">Enter up to two alloying elements in atomic percent. Host at.% is calculated automatically.</p>
+            <p id="latticeStatus" class="hint">The lattice parameter is calculated from the supplied papers when the selected composition is covered.</p>
+            <p class="hint">Select up to two alloying elements from the paper-supported list. Host at.% is calculated automatically.</p>
             <table class="composition-table">
               <thead><tr><th>Alloying element</th><th>at.%</th><th></th></tr></thead>
               <tbody id="compositionRows"></tbody>
             </table>
             <button id="addAlloyBtn" class="secondary" onclick="addCompositionRow()">+ Add alloying element</button>
             <div id="compositionSummary" class="summary compact"></div>
+            <div class="grid two">
+              <label>Vacancy configuration
+                <select id="vacancyConfiguration" onchange="updateVacancyAvailability()">
+                  <option value="0">No vacancy</option>
+                  <option value="1">One isolated monovacancy</option>
+                </select>
+              </label>
+              <div id="vacancyStatus" class="hint">Vacancy simulation is available for BCC W–H using the supplied single-H monovacancy data. Fe vacancy transition data is incomplete.</div>
+            </div>
           </section>
 
           <section class="card">
@@ -149,19 +164,16 @@
                 <select id="boundaryType"><option value="surface_return">Surface return vs bulk transmission</option><option value="bulk_transmission">Bulk transmission</option><option value="retention">Retention between two absorbing boundaries</option></select>
               </label>
             </div>
-            <button onclick="prepareEnergyInputs()">Calculate domain and generate energy inputs</button>
+            <button onclick="prepareEnergyInputs()">Calculate domain and look up paper values</button>
             <div id="domainSummary" class="summary"></div>
           </section>
 
           <section class="card">
-            <h2>3. Required user-supplied energy values</h2>
+            <h2>3. Paper-sourced energy values</h2>
             <p class="hint">
-              Vital-energy mode. All energies are in eV. You supply one baseline migration barrier plus, for each
-              alloying element, a site-energy shift ΔU and a saddle-energy shift ΔE‡.
-              Negative ΔU means the interstitial is stabilised/trapped near that solute; positive ΔE‡ means the solute
-              raises the local jump barrier. Host site energy is fixed at 0, and surface/bulk exit barriers default to the
-              host migration barrier (no separate inputs required in this version). Defaults are pre-filled with the
-              validation-example values.
+              Material energy values and provenance are loaded from the repository workbook. A run is enabled only
+              when every required material energy has a compatible paper-supported record or an explicitly labeled
+              sign mapping. Missing material energies are never filled with defaults; solver rules are shown separately.
             </p>
             <div id="energyFields" class="energy-fields"></div>
           </section>
@@ -220,38 +232,33 @@
           <section class="card notice">
             <h2>Overview</h2>
             <p>
-              This worked example demonstrates how IDOMS converts literature-based energetic inputs into a
-              pathway-resolved description of interstitial hydrogen transport. The model system is a BCC
-              Fe–1 at.% C–9 at.% Cr alloy, with hydrogen diffusing on the tetrahedral interstitial network at
-              T = 600 K. Carbon is treated as an octahedral interstitial solute that introduces an attractive
-              hydrogen site-energy shift and a local saddle-barrier penalty. Chromium is included as a substitutional
-              alloying element and is treated as a weak repulsive/modifying solute rather than a strong hydrogen trap.
+              The tool starts with pure BCC Fe–H, for which the supplied papers provide a baseline migration barrier.
+              When alloying elements are added, the backend checks each required site and saddle value against the
+              database; missing records block the run.
             </p>
             <p>
-              The default energetic inputs are chosen from first-principles and kinetic-transport literature. The
-              baseline hydrogen migration barrier in BCC Fe is set to E<sub>m</sub><sup>0</sup> = 0.088 eV following
-              Jiang and Carter. The carbon-associated hydrogen trapping/site-energy scale is taken as
-              ΔU<sub>C</sub> ≈ −0.09 eV, based on first-principles hydrogen-trap energetics in α-Fe. Chromium-associated
-              hydrogen transport modification is represented conservatively as a weak site-energy/saddle-energy
-              perturbation, consistent with first-principles Fe–Cr hydrogen-transport studies. The C-associated saddle
-              shift is a transparent local-barrier input representing distortion of the hydrogen jump landscape near
-              carbon-rich environments; this value is editable by the user.
+              The current source set supports a pure BCC Fe–H baseline and contains a clearly labeled mapping of the
+              reported H–C binding energy to the IDOMS site-energy convention. It does not supply a numeric H jump
+              saddle shift near C or numeric local site/saddle shifts near Cr. Those missing fields block the
+              Fe–C–Cr example until source papers provide matching values.
             </p>
             <p>
-              The purpose is not to claim a universal Fe–C–Cr parameter set, but to show how a small number of
-              physically meaningful energy inputs can be transformed into quantitative pathway metrics.
+              BCC W–H can include fixed monovacancies as single-H traps using the S7 first-occupancy binding and
+              detrapping data. Multi-H vacancy occupancy, vacancy migration, vacancy clusters, and Fe vacancy kinetics
+              are outside the implemented model because the supplied sources do not provide a complete matching set
+              of runtime parameters for those cases.
             </p>
           </section>
 
           <section class="card">
-            <h2>Input values</h2>
+            <h2>Illustrative setup values (not extracted from papers)</h2>
             <div class="grid two">
               <div>
                 <h3 class="io-head">System &amp; domain</h3>
                 <table class="io-table">
                   <tbody>
                     <tr><td>Host element</td><td>Fe (BCC)</td></tr>
-                    <tr><td>Lattice parameter, a</td><td>2.866 Å</td></tr>
+                    <tr><td>Lattice parameter, a</td><td>MISSING for Fe–C–Cr in the supplied papers</td></tr>
                     <tr><td>Alloying elements</td><td>C 1.0 at.%, Cr 9.0 at.%</td></tr>
                     <tr><td>Host content</td><td>90.0 at.%</td></tr>
                     <tr><td>Interstitial species</td><td>H (tetrahedral network)</td></tr>
@@ -264,16 +271,14 @@
                 </table>
               </div>
               <div>
-                <h3 class="io-head">Energy inputs (eV)</h3>
+                <h3 class="io-head">Paper energy availability</h3>
                 <table class="io-table">
                   <tbody>
-                    <tr><td>Host migration barrier, E<sub>m</sub><sup>0</sup></td><td>0.088</td></tr>
-                    <tr><td>Surface-exit barrier</td><td>0.088 (= E<sub>m</sub><sup>0</sup>)</td></tr>
-                    <tr><td>Bulk-exit barrier</td><td>0.088 (= E<sub>m</sub><sup>0</sup>)</td></tr>
-                    <tr><td>ΔU<sub>C</sub> (site shift)</td><td>−0.090</td></tr>
-                    <tr><td>ΔE‡<sub>C</sub> (saddle shift)</td><td>+0.070</td></tr>
-                    <tr><td>ΔU<sub>Cr</sub> (site shift)</td><td>+0.025</td></tr>
-                    <tr><td>ΔE‡<sub>Cr</sub> (saddle shift)</td><td>+0.007</td></tr>
+                    <tr><td>BCC Fe–H baseline migration barrier</td><td>0.088 eV (paper)</td></tr>
+                    <tr><td>H–C site-energy mapping</td><td>−0.090 eV (mapped from reported +0.09 eV binding)</td></tr>
+                    <tr><td>H jump saddle shift near C</td><td>MISSING</td></tr>
+                    <tr><td>Numeric H site shift near Cr</td><td>MISSING (paper statement is qualitative)</td></tr>
+                    <tr><td>H jump saddle shift near Cr</td><td>MISSING</td></tr>
                   </tbody>
                 </table>
               </div>
@@ -282,34 +287,12 @@
 
           <section class="card">
             <h2>Quantitative numerical results</h2>
-            <div class="metrics-grid">
-              <div class="metric"><div class="value">9.569e-11</div><div class="label">Mean first-passage time (s)</div></div>
-              <div class="metric"><div class="value">0.2249</div><div class="label">Probability of bulk transmission</div></div>
-              <div class="metric"><div class="value">0.7751</div><div class="label">Probability of surface return</div></div>
-              <div class="metric"><div class="value">0.0941</div><div class="label">Critical bottleneck barrier (eV)</div></div>
-              <div class="metric"><div class="value">7.398e-12</div><div class="label">Minimum path resistance (s)</div></div>
-              <div class="metric"><div class="value">1.4660</div><div class="label">Pathway tortuosity</div></div>
-              <div class="metric"><div class="value">0.0902</div><div class="label">Mean activation barrier on dominant path (eV)</div></div>
-              <div class="metric"><div class="value">0.1997</div><div class="label">Trap residence fraction</div></div>
-              <div class="metric"><div class="value">0.9922</div><div class="label">Accessible interstitial fraction</div></div>
-              <div class="metric"><div class="value">1.1025</div><div class="label">Retention factor vs ideal host</div></div>
-            </div>
-            <h3 class="io-head">Network and configuration</h3>
-            <table class="io-table wide">
-              <tbody>
-                <tr><td>Fe lattice sites</td><td>600</td><td>H tetrahedral sites</td><td>4180</td></tr>
-                <tr><td>H–H jump edges</td><td>7780</td><td>C on octahedral sites</td><td>6</td></tr>
-                <tr><td>Cr substitutional sites</td><td>54</td><td>Dominant absorbing boundary</td><td>Surface</td></tr>
-                <tr><td>Transport channel length</td><td>49 jumps</td><td>Channel z-span</td><td>11.5 cells</td></tr>
-              </tbody>
-            </table>
+            <p class="hint">No static simulation results are presented. Results appear here only after the backend confirms that every required energy is supported by the paper database.</p>
           </section>
 
           <section class="card">
             <h2>Consolidated visual results</h2>
-            <div class="figure-wrap">
-              <img src="idoms_worked_example.png" style="max-width:100%;height:auto;display:block;margin:0 auto" alt="Consolidated worked-example figure: minimum-resistance channel, barrier profile, global survival, and site-resolved survival map." />
-            </div>
+            <p class="hint">A pathway figure is generated only for a completed run using resolved, paper-supported energy values.</p>
           </section>
 
           <section class="card">
@@ -409,10 +392,8 @@
             <p>
               This distinction is important: a trap is not only a low-energy site; it may also be difficult to escape from,
               because the activation barrier out of that site depends on the difference between the saddle energy and the
-              site energy. In the minimal quantitative mode, the user supplies the essential energy inputs in eV — typically
-              the host migration barrier, surface-exit barrier, bulk-exit barrier, and the most important solute-associated
-              site and saddle perturbations. The tool does not estimate these values in the proof-of-concept version; it only
-              uses the user-provided values.
+              site energy. The backend resolves compatible energy inputs from the paper database. It does not estimate
+              missing values; an incomplete record set blocks the run.
             </p>
 
             <h3>3. Jump rates from activation barriers</h3>
@@ -532,7 +513,7 @@
               peaks corresponding to local bottlenecks. The global survival-probability plot shows how quickly interstitial
               atoms are absorbed by the boundaries, with the mean first-passage time marked. The site-resolved survival map
               shows where the interstitial species is likely to survive longer if inserted at different positions in the
-              domain. Together, these outputs convert user-supplied alloy energetics into a quantitative and visual
+              domain. Together, these outputs convert database-resolved alloy energetics into a quantitative and visual
               description of interstitial transport. The central aim of IDOMS is therefore not only to report a
               diffusivity-like number, but to show where the interstitial species moves, what it avoids, where it is
               trapped, what barrier controls transport, and whether the material promotes retention, surface return, or
@@ -542,7 +523,7 @@
         </main>
       </section>
 
-      <footer class="site-foot">IDOMS trial tool · Two-alloy module · No database, no energy estimation · Theoretical Metallurgy Group, NIT Tiruchirappalli.</footer>
+      <footer class="site-foot">IDOMS trial tool · Paper-sourced energetics database · Missing values block simulation · Theoretical Metallurgy Group, NIT Tiruchirappalli.</footer>
     </div>
   </div>
 

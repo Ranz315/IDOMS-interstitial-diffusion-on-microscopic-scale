@@ -4,7 +4,7 @@ from typing import Dict, Any, Tuple
 import numpy as np
 from scipy.spatial import cKDTree
 from scipy.sparse import csr_matrix, diags
-from scipy.sparse.linalg import spsolve, expm_multiply
+from scipy.sparse.linalg import spsolve, splu, expm_multiply
 
 # ---------------------------------------------------------------------------
 # Constants  (ported verbatim from the IDOMS worked validation example so the
@@ -303,9 +303,13 @@ def add_w_vacancy_traps(base_sites, base_edges, base_mids, vacancy_positions,
 def solve_first_passage(system, start):
     A = system["A"]
     try:
-        qsurf = np.clip(spsolve(A, system["k_surface"]), 0.0, 1.0)
-        tabs = np.maximum(spsolve(A, np.ones(A.shape[0])), 0.0)
-        res = np.maximum(spsolve(A.T, start), 0.0)
+        # Factor once and reuse the sparse LU for both forward solves and the
+        # transposed residence solve. This is algebraically equivalent to the
+        # three separate spsolve calls, but avoids refactorizing the same A.
+        factor = splu(A.tocsc())
+        qsurf = np.clip(factor.solve(system["k_surface"]), 0.0, 1.0)
+        tabs = np.maximum(factor.solve(np.ones(A.shape[0])), 0.0)
+        res = np.maximum(factor.solve(start, trans="T"), 0.0)
         mfpt = float(start @ tabs)
         psurf = float(start @ qsurf); pbulk = 1.0 - psurf
     except Exception:

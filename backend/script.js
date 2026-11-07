@@ -339,6 +339,12 @@ function renderEnergyFields(resolution) {
 }
 
 async function runSimulation() {
+  const runButton = document.querySelector('button[onclick="runSimulation()"]');
+  if (runButton?.disabled) return;
+  if (runButton) {
+    runButton.disabled = true;
+    runButton.textContent = "Running simulation…";
+  }
   try {
     await prepareEnergyInputs();
     if (!latestSetup || !latestEnergyResolution) return;
@@ -353,10 +359,17 @@ async function runSimulation() {
     latestResult = await response.json();
     if (latestResult && latestResult.error) throw new Error(latestResult.error);
     renderResults(latestResult);
-    document.getElementById("runStatus").textContent = "Simulation complete using paper-database energy values.";
+    const survivalMethod = latestResult.survival_output_method || "matrix exponential";
+    document.getElementById("runStatus").textContent =
+      `Simulation complete using paper-database energy values. Survival plot method: ${survivalMethod}.`;
   } catch (err) {
     alert(err.message);
     document.getElementById("runStatus").textContent = "Simulation failed.";
+  } finally {
+    if (runButton) {
+      runButton.disabled = false;
+      runButton.textContent = "Run backend simulation and visualise pathway";
+    }
   }
 }
 

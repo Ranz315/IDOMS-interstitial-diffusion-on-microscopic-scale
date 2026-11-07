@@ -332,6 +332,20 @@ def solve_mfpt(system, start):
 def survival_outputs(system, start, mfpt, npts=80):
     Q = system["Q"]; tmax = max(5.0 * mfpt, 1e-13)
     times = np.linspace(0.0, tmax, npts)
+    # A vacancy model can combine ~1e13/s lattice hops with very slow escape
+    # from a deep trap. Propagating exp(Q*t) across that full timescale range
+    # makes Krylov exponential action impractically expensive. The first-passage
+    # metrics are solved separately from the master equation; for this stiff
+    # visualization case, use the explicitly labeled MFPT-based approximation.
+    max_rate = float(np.max(system["total"])) if len(system["total"]) else 0.0
+    if max_rate * tmax > 1e6:
+        safe_mfpt = max(mfpt, 1e-30)
+        S = np.exp(-times / safe_mfpt)
+        S[0] = 1.0
+        S_map = np.clip(np.exp(-safe_mfpt / np.maximum(system["total"], 1e-30)), 0.0, 1.0)
+        return times, S, S_map, "MFPT-based approximation (stiff survival visualization)"
+
+    method = "matrix exponential"
     try:
         P = expm_multiply(Q.T, start, start=0.0, stop=tmax, num=npts)
         S = np.clip(np.asarray(P.sum(axis=1)).ravel(), 0.0, 1.0)
@@ -339,15 +353,17 @@ def survival_outputs(system, start, mfpt, npts=80):
             raise ValueError("bad survival")
     except Exception:
         S = np.exp(-times / max(mfpt, 1e-30))
+        method = "MFPT-based approximation (matrix exponential failed)"
     try:
         S_map = np.clip(np.asarray(expm_multiply(Q * max(mfpt, 1e-30), np.ones(Q.shape[0]))).ravel(), 0.0, 1.0)
         if not np.all(np.isfinite(S_map)):
             raise ValueError("bad map")
     except Exception:
         S_map = np.clip(np.exp(-max(mfpt, 1e-30) / np.maximum(system["total"], 1e-30)), 0.0, 1.0)
+        method = "MFPT-based approximation (matrix exponential failed)"
     if len(S):
         S[0] = 1.0
-    return times, S, S_map
+    return times, S, S_map, method
 
 
 def dijkstra_to_boundary(system, start_idx, target):
@@ -494,7 +510,7 @@ def run_simulation(setup: Dict[str, Any], energies_eV: Dict[str, float]) -> Dict
                           mobile_site_count=len(base_sites))
     start = source_distribution(sites, setup, mobile_site_count=len(base_sites))
     fp = solve_first_passage(system, start)
-    times, S, S_map = survival_outputs(system, start, fp["mfpt"])
+    times, S, S_map, survival_output_method = survival_outputs(system, start, fp["mfpt"])
 
     # --- ideal-host reference (retention) ---
     U_h, S_h = compute_fields(base_sites, base_mids, {}, {"host_migration_barrier": E0}, a)
@@ -597,6 +613,7 @@ def run_simulation(setup: Dict[str, Any], energies_eV: Dict[str, float]) -> Dict
         },
         # ---- plot (c): global survival probability ----
         "survival_probability": {"time_s": times.tolist(), "S_t": np.asarray(S).tolist(), "mfpt_s": fp["mfpt"]},
+        "survival_output_method": survival_output_method,
         # ---- plot (d): site-resolved survival map at t = MFPT ----
         "survival_map": survival_map,
         "domain": setup["domain"],

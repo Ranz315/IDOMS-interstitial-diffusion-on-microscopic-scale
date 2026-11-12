@@ -225,6 +225,20 @@ function collectSetup() {
   if (!(slabThicknessNm > 0)) throw new Error("Please enter a valid slab thickness in nm.");
   const sitePerCell = crystal === "BCC" ? 2 : 4;
   const domain = calculateEfficientDomain(composition, crystal, aAng, slabThicknessNm);
+  const rawInjection = ["injectionX", "injectionY", "injectionZ"].map(id => document.getElementById(id).value.trim());
+  const hasInjectionCoordinate = rawInjection.some(value => value !== "");
+  let injectionPosition = {};
+  if (hasInjectionCoordinate) {
+    if (rawInjection.some(value => value === "" || !Number.isFinite(Number(value)))) {
+      throw new Error("Enter all three injection coordinates (x/a, y/a, z/a), or leave all three blank.");
+    }
+    const coords = rawInjection.map(Number);
+    const limits = [domain.Nx, domain.Ny, domain.Nz];
+    if (coords.some((value, i) => value < 0 || value > limits[i])) {
+      throw new Error(`Injection coordinates must be inside the domain: x/a 0–${domain.Nx}, y/a 0–${domain.Ny}, z/a 0–${domain.Nz}.`);
+    }
+    injectionPosition = {x: coords[0], y: coords[1], z: coords[2]};
+  }
   return {
     host,
     alloying_elements: alloyingElements,
@@ -233,6 +247,7 @@ function collectSetup() {
     crystal_structure: crystal,
     lattice_parameter_A: aAng,
     vacancy_count: vacancyCount,
+    injection_position_fractional: injectionPosition,
     interstitial_species: document.getElementById("interstitialSpecies").value,
     site_network: document.getElementById("siteNetwork").value,
     temperature_K: temperatureK,
@@ -295,10 +310,58 @@ async function prepareEnergyInputs() {
     if (!response.ok) throw new Error(typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail || data));
     latestEnergyResolution = data;
     renderEnergyFields(data);
+    renderVacancyTransitionProfile(data);
     document.getElementById("runStatus").textContent = data.runnable
       ? "Paper-supported energy values are ready."
       : "Simulation blocked: one or more required paper values are missing.";
   } catch (err) { alert(err.message); }
+}
+
+function renderVacancyTransitionProfile(resolution) {
+  const card = document.getElementById("vacancyEnergyCard");
+  const note = document.getElementById("vacancyEnergyNote");
+  const plot = document.getElementById("vacancyEnergyPlot");
+  if (!card || !note || !plot) return;
+  const supported = latestSetup?.host === "W" && latestSetup?.crystal_structure === "BCC" &&
+    latestSetup?.interstitial_species === "H" && Number(latestSetup?.vacancy_count) === 1;
+  card.hidden = !supported;
+  if (!supported) {
+    if (window.Plotly) Plotly.purge(plot);
+    return;
+  }
+
+  const p = resolution.resolved_vacancy_parameters || {};
+  const binding = p.W_vacancy_H1_binding_eV;
+  const capture = p.W_vacancy_H1_capture_barrier_eV;
+  const detrapping = p.W_vacancy_H1_detrapping_barrier_eV;
+  if (![binding, capture, detrapping].every(Number.isFinite)) {
+    note.textContent = "MISSING: compatible S7 single-H vacancy transition values were not resolved; no profile is drawn.";
+    Plotly.purge(plot);
+    return;
+  }
+
+  const profileNote = `S7 DFT intrinsic single-H energies: binding = ${binding.toFixed(2)} eV; capture barrier = ${capture.toFixed(2)} eV (derived); detrapping barrier = ${detrapping.toFixed(2)} eV. These transition energies apply if H enters the vacancy; injection position changes the computed encounter and residence, not these paper values.`;
+  note.dataset.profileBase = profileNote;
+  note.textContent = profileNote;
+  const labels = ["Bulk H\n(T site)", "Capture\nsaddle", "Vacancy H₁\n(trapped)", "Detrapping\nsaddle", "Bulk H\n(T site)"];
+  const energies = [0, capture, binding, capture, 0];
+  const traces = [{
+    x: [0, 1, 2, 3, 4], y: energies,
+    mode: "lines+markers+text", type: "scatter", name: "S7 single-H path",
+    text: ["0 eV", `+${capture.toFixed(2)} eV`, `${binding.toFixed(2)} eV`, `+${capture.toFixed(2)} eV`, "0 eV"],
+    textposition: ["bottom center", "top center", "bottom center", "top center", "bottom center"],
+    line: {color: TEAL, width: 3}, marker: {size: 10, color: ["#0284c7", "#dc2626", "#7c3aed", "#dc2626", "#0284c7"]}
+  }];
+  Plotly.newPlot(plot, traces, {
+    title: "S7 vacancy capture and detrapping energy path",
+    xaxis: {title: "transition coordinate (schematic)", tickmode: "array", tickvals: [0, 1, 2, 3, 4], ticktext: labels},
+    yaxis: {title: "energy relative to bulk tetrahedral H (eV)", range: [binding - 0.35, capture + 0.55]},
+    annotations: [
+      {x: 0.5, y: capture + 0.18, showarrow: false, text: `capture ΔE‡ = ${capture.toFixed(2)} eV`, font: {size: 11, color: "#0f766e"}},
+      {x: 2.5, y: capture + 0.38, showarrow: false, text: `detrapping ΔE‡ = ${detrapping.toFixed(2)} eV`, font: {size: 11, color: "#b91c1c"}}
+    ],
+    showlegend: false, margin: {l: 75, r: 30, t: 55, b: 80}
+  }, {responsive: true});
 }
 
 function renderEnergyFields(resolution) {
@@ -339,6 +402,12 @@ function renderEnergyFields(resolution) {
 }
 
 async function runSimulation() {
+  const runButton = document.querySelector('button[onclick="runSimulation()"]');
+  if (runButton?.disabled) return;
+  if (runButton) {
+    runButton.disabled = true;
+    runButton.textContent = "Running simulation…";
+  }
   try {
     await prepareEnergyInputs();
     if (!latestSetup || !latestEnergyResolution) return;
@@ -353,10 +422,17 @@ async function runSimulation() {
     latestResult = await response.json();
     if (latestResult && latestResult.error) throw new Error(latestResult.error);
     renderResults(latestResult);
-    document.getElementById("runStatus").textContent = "Simulation complete using paper-database energy values.";
+    const survivalMethod = latestResult.survival_output_method || "matrix exponential";
+    document.getElementById("runStatus").textContent =
+      `Simulation complete using paper-database energy values. Survival plot method: ${survivalMethod}.`;
   } catch (err) {
     alert(err.message);
     document.getElementById("runStatus").textContent = "Simulation failed.";
+  } finally {
+    if (runButton) {
+      runButton.disabled = false;
+      runButton.textContent = "Run backend simulation and visualise pathway";
+    }
   }
 }
 
@@ -364,8 +440,25 @@ function renderResults(result) {
   renderMetricCards(result.metrics || {});
   renderPathPlot(result);
   renderBarrierPlot(result);
+  updateVacancyProfileOutcome(result);
   renderSurvivalPlot(result);
   renderSurvivalMapPlot(result);
+}
+
+function updateVacancyProfileOutcome(result) {
+  const box = document.getElementById("vacancyRunOutcome");
+  if (!box) return;
+  if (!result.vacancy_configuration?.enabled) {
+    box.hidden = true;
+    return;
+  }
+  const fraction = result.metrics?.trap_residence_fraction;
+  if (!Number.isFinite(fraction)) {
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+  box.textContent = `This run: ${formatValue(100 * fraction)}% of calculated residence time was in vacancy trap states. This is a residence-time fraction, not a capture probability.`;
 }
 
 function isFiniteArray(arr) { return Array.isArray(arr) && arr.length > 0 && arr.every(v => Number.isFinite(v)); }
@@ -446,6 +539,11 @@ function renderBarrierPlot(result) {
     shapes.push({type: "line", x0: jx, x1: jx, yref: "paper", y0: 0, y1: 1, line: {dash: "dot", width: 1.2, color: "#f59e0b"}});
     anns.push({x: jx, yref: "paper", y: 0.98, yanchor: "top", showarrow: false, text: "injection", textangle: 90, font: {size: 10, color: "#b45309"}});
   }
+  if (result.vacancy_configuration?.enabled && !bp.channel_crosses_vacancy_trap) {
+    anns.push({xref: "paper", x: 0.99, y: 0.96, xanchor: "right", yanchor: "top", showarrow: false,
+      text: "Selected channel avoids vacancy; trapping affects residence time, not this path profile.",
+      font: {size: 10, color: "#475569"}});
+  }
   Plotly.newPlot("barrierPlot", traces, {
     title: "Activation-barrier profile along channel (surface → bulk)",
     xaxis: {title: "jump index along channel"},
@@ -465,8 +563,9 @@ function renderSurvivalPlot(result) {
     shapes.push({type: "line", x0: mfpt, x1: mfpt, yref: "paper", y0: 0, y1: 1, line: {dash: "dot", width: 1.4, color: "#dc2626"}});
     anns.push({x: mfpt, y: 0.5, xanchor: "left", showarrow: false, text: ` MFPT = ${Number(mfpt).toExponential(2)} s`, font: {size: 11, color: "#991b1b"}});
   }
+  const approximate = String(result.survival_output_method || "").includes("approximation");
   Plotly.newPlot("survivalPlot", [{x: t, y: s, mode: "lines", type: "scatter", name: "S(t)", fill: "tozeroy", fillcolor: "rgba(15,118,110,0.08)", line: {width: 3, color: TEAL}}], {
-    title: "Global survival probability S(t)",
+    title: approximate ? "Global survival probability S(t) — MFPT-based approximation" : "Global survival probability S(t)",
     xaxis: {title: "time (s)"}, yaxis: {title: "S(t)", range: [0, 1.05]},
     shapes, annotations: anns, showlegend: false, margin: {l: 65, r: 30, t: 55, b: 60}
   }, {responsive: true});
@@ -476,7 +575,7 @@ function renderSurvivalPlot(result) {
 function renderSurvivalMapPlot(result) {
   const d = result.domain || latestSetup.domain;
   const m = result.survival_map || {x: [], z: [], S: []};
-  const traces = [{
+  const traces = m.available === false ? [] : [{
     x: m.x || [], y: m.z || [], mode: "markers", type: "scattergl", name: "S_i(MFPT)",
     marker: {size: 6, color: m.S || [], colorscale: "Viridis", cmin: 0, cmax: 1, colorbar: {title: "P(survive<br>to MFPT)"}, symbol: "square"}
   }];
@@ -486,9 +585,11 @@ function renderSurvivalMapPlot(result) {
     if (Number.isInteger(path.injection_index)) traces.push({x: [path.x[path.injection_index]], y: [path.z[path.injection_index]], mode: "markers", type: "scatter", name: "injection", marker: {size: 15, symbol: "star", color: "#fde047", line: {width: 0.7, color: "#111"}}});
   }
   Plotly.newPlot("survivalMapPlot", traces, {
-    title: "Site-resolved survival probability at t = MFPT",
+    title: m.available === false ? "Site-resolved survival map omitted for approximate global curve" : "Site-resolved survival probability at t = MFPT",
     xaxis: {title: "x / a", range: [0, d.Nx]},
     yaxis: {title: "depth z / a", range: [d.Nz, 0]},
+    annotations: m.available === false ? [{xref: "paper", yref: "paper", x: 0.5, y: 0.5, showarrow: false,
+      text: m.reason || "Not calculated for this run."}] : [],
     legend: {orientation: "h"}, margin: {l: 65, r: 30, t: 55, b: 70}
   }, {responsive: true});
 }

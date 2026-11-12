@@ -164,6 +164,12 @@
                 <select id="boundaryType"><option value="surface_return">Surface return vs bulk transmission</option><option value="bulk_transmission">Bulk transmission</option><option value="retention">Retention between two absorbing boundaries</option></select>
               </label>
             </div>
+            <p class="hint">Optional injection site in fractional lattice coordinates (x/a, y/a, z/a). Enter all three coordinates to place H at the nearest interstitial site; leave all blank for automatic placement. With one W vacancy, the vacancy is placed near the selected injection location.</p>
+            <div class="grid three">
+              <label>Injection x/a <input id="injectionX" type="number" min="0" step="0.25" placeholder="Auto" /></label>
+              <label>Injection y/a <input id="injectionY" type="number" min="0" step="0.25" placeholder="Auto" /></label>
+              <label>Injection z/a <input id="injectionZ" type="number" min="0" step="0.25" placeholder="Auto" /></label>
+            </div>
             <button onclick="prepareEnergyInputs()">Calculate domain and look up paper values</button>
             <div id="domainSummary" class="summary"></div>
           </section>
@@ -201,14 +207,22 @@
             <div id="barrierPlot" class="plot small"></div>
           </section>
 
+          <section id="vacancyEnergyCard" class="card" hidden>
+            <h2>8. W monovacancy capture–detrapping profile</h2>
+            <p class="hint">Paper-sourced single-H energy levels relative to H in a bulk tetrahedral site. The capture saddle is derived from the S7 binding and detrapping relation; it is separate from the minimum-resistance channel.</p>
+            <div id="vacancyEnergyNote" class="hint"></div>
+            <div id="vacancyRunOutcome" class="summary compact" hidden></div>
+            <div id="vacancyEnergyPlot" class="plot small"></div>
+          </section>
+
           <section class="card">
-            <h2>8. Global survival probability</h2>
+            <h2>9. Global survival probability</h2>
             <p class="hint">Fraction of the injected population still resident versus time, with the mean first-passage time marked.</p>
             <div id="survivalPlot" class="plot small"></div>
           </section>
 
           <section class="card">
-            <h2>9. Site-resolved survival map at t = MFPT</h2>
+            <h2>10. Site-resolved survival map at t = MFPT</h2>
             <p class="hint">Per-site probability of surviving to the mean first-passage time, projected onto the depth plane.</p>
             <div id="survivalMapPlot" class="plot"></div>
           </section>
@@ -527,6 +541,6 @@
     </div>
   </div>
 
-  <script src="script.js?v=2026-07-05-06"></script>
+  <script src="script.js?v=2026-11-12-04"></script>
 </body>
 </html>

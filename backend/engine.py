@@ -247,7 +247,11 @@ def place_vacancies(host_pts, setup):
         raise ValueError("The paper-supported vacancy model includes exactly one isolated monovacancy.")
     nx, ny, nz = setup["domain"]["Nx"], setup["domain"]["Ny"], setup["domain"]["Nz"]
     a = float(setup["lattice_parameter_A"])
-    center = np.asarray([0.5 * nx * a, 0.5 * ny * a, 0.5 * nz * a])
+    # Put the isolated vacancy inside the injected H distribution so this
+    # configuration tests capture/detrapping. It remains a fixed vacancy;
+    # the solver's least-resistance through-channel may still route around it.
+    z_fraction = SOURCE_Z_FRACTION.get(setup.get("boundary", "surface_return"), 0.23)
+    center = np.asarray([0.5 * nx * a, 0.5 * ny * a, z_fraction * nz * a])
     index = int(np.argmin(np.linalg.norm(host_pts - center, axis=1)))
     return host_pts[index:index + 1]
 
@@ -333,7 +337,7 @@ def solve_mfpt(system, start):
     return mfpt
 
 
-def survival_outputs(system, start, mfpt, npts=80):
+def survival_outputs(system, start, mfpt, npts=80, force_approx=False):
     Q = system["Q"]; tmax = max(5.0 * mfpt, 1e-13)
     times = np.linspace(0.0, tmax, npts)
     # A vacancy model can combine ~1e13/s lattice hops with very slow escape
@@ -342,12 +346,12 @@ def survival_outputs(system, start, mfpt, npts=80):
     # metrics are solved separately from the master equation; for this stiff
     # visualization case, use the explicitly labeled MFPT-based approximation.
     max_rate = float(np.max(system["total"])) if len(system["total"]) else 0.0
-    if max_rate * tmax > 1e6:
+    if force_approx or max_rate * tmax > 1e6:
         safe_mfpt = max(mfpt, 1e-30)
         S = np.exp(-times / safe_mfpt)
         S[0] = 1.0
-        S_map = np.clip(np.exp(-safe_mfpt / np.maximum(system["total"], 1e-30)), 0.0, 1.0)
-        return times, S, S_map, "MFPT-based approximation (stiff survival visualization)"
+        reason = "W-vacancy run" if force_approx else "stiff rate range"
+        return times, S, None, f"MFPT-based approximation ({reason}; path and MFPT remain solver-calculated)"
 
     method = "matrix exponential"
     try:
@@ -363,7 +367,7 @@ def survival_outputs(system, start, mfpt, npts=80):
         if not np.all(np.isfinite(S_map)):
             raise ValueError("bad map")
     except Exception:
-        S_map = np.clip(np.exp(-max(mfpt, 1e-30) / np.maximum(system["total"], 1e-30)), 0.0, 1.0)
+        S_map = None
         method = "MFPT-based approximation (matrix exponential failed)"
     if len(S):
         S[0] = 1.0
@@ -514,7 +518,9 @@ def run_simulation(setup: Dict[str, Any], energies_eV: Dict[str, float]) -> Dict
                           mobile_site_count=len(base_sites))
     start = source_distribution(sites, setup, mobile_site_count=len(base_sites))
     fp = solve_first_passage(system, start)
-    times, S, S_map, survival_output_method = survival_outputs(system, start, fp["mfpt"])
+    times, S, S_map, survival_output_method = survival_outputs(
+        system, start, fp["mfpt"], force_approx=bool(len(vacancy_traps))
+    )
 
     # --- ideal-host reference (retention) ---
     U_h, S_h = compute_fields(base_sites, base_mids, {}, {"host_migration_barrier": E0}, a)
@@ -573,9 +579,13 @@ def run_simulation(setup: Dict[str, Any], energies_eV: Dict[str, float]) -> Dict
 
     # --- site-resolved survival map (projected, thinned) ---
     map_i = thin_idx(len(sites), 3000)
-    survival_map = {"x": (sites[map_i, 0] / a).tolist(),
-                    "z": (sites[map_i, 2] / a).tolist(),
-                    "S": np.asarray(S_map)[map_i].tolist()}
+    survival_map = ({"x": (sites[map_i, 0] / a).tolist(),
+                     "z": (sites[map_i, 2] / a).tolist(),
+                     "S": np.asarray(S_map)[map_i].tolist(),
+                     "available": True}
+                    if S_map is not None else
+                    {"x": [], "z": [], "S": [], "available": False,
+                     "reason": "Site-resolved survival was omitted because the global curve uses an MFPT approximation."})
 
     result = {
         "metrics": {
@@ -614,6 +624,7 @@ def run_simulation(setup: Dict[str, Any], energies_eV: Dict[str, float]) -> Dict
             "host_barrier_eV": E0,
             "bottleneck_index": int(np.argmax(ch_e) + 1) if len(ch_e) else 0,
             "injection_index": int(junction),
+            "channel_crosses_vacancy_trap": bool(len(vacancy_traps) and any(i >= len(base_sites) for i in channel)),
         },
         # ---- plot (c): global survival probability ----
         "survival_probability": {"time_s": times.tolist(), "S_t": np.asarray(S).tolist(), "mfpt_s": fp["mfpt"]},
@@ -633,7 +644,7 @@ def run_simulation(setup: Dict[str, Any], energies_eV: Dict[str, float]) -> Dict
             "energy_definition": "E_act(i->j) = E_saddle(i,j) - U_i, with U_i the explicit diffusing-species site energy.",
             "channel": "Visualised pathway is the continuous minimum-resistance channel surface <-> injection <-> bulk.",
             "retention_definition": "Retention factor = tau_MFPT(alloy) / tau_MFPT(ideal host) on the same domain.",
-            "vacancy_model": ("One W monovacancy is placed at the host-lattice site nearest the simulation-cell center. The model traps one dilute mobile H atom and uses S7 DFT single-H binding, detrapping barrier, and attempt frequency. Vacancy concentration, multi-H occupancy, vacancy migration, and vacancy clusters are not modeled." if len(vacancy_positions) else "No vacancy sites were included."),
+            "vacancy_model": ("One fixed W monovacancy is placed at the host-lattice site nearest the H injection-distribution center so injected H can encounter the trap. The model uses S7 DFT single-H binding, detrapping barrier, and attempt frequency. The minimum-resistance through-channel can still route around this side trap. Vacancy concentration, multi-H occupancy, vacancy migration, and vacancy clusters are not modeled." if len(vacancy_positions) else "No vacancy sites were included."),
         },
     }
     return json_safe(result)

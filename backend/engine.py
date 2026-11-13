@@ -226,6 +226,14 @@ def build_system(sites, edges, mids, U, Sshift, setup, energies,
 def source_distribution(sites, setup, mobile_site_count=None):
     a = float(setup["lattice_parameter_A"])
     nx, ny, nz = setup["domain"]["Nx"], setup["domain"]["Ny"], setup["domain"]["Nz"]
+    custom_position = setup.get("injection_position_fractional") or {}
+    mobile_count = len(sites) if mobile_site_count is None else int(mobile_site_count)
+    if custom_position:
+        target = np.asarray([custom_position[axis] for axis in ("x", "y", "z")], dtype=float) * a
+        nearest = int(np.argmin(np.linalg.norm(sites[:mobile_count] - target, axis=1)))
+        weights = np.zeros(len(sites), dtype=float)
+        weights[nearest] = 1.0
+        return weights
     zf = SOURCE_Z_FRACTION.get(setup["boundary"], 0.23)
     cx, cy, cz = 0.5 * nx * a, 0.5 * ny * a, zf * nz * a
     sig_xy = SOURCE_SIGMA_XY_A * a; sig_z = SOURCE_SIGMA_Z_A * a
@@ -250,8 +258,12 @@ def place_vacancies(host_pts, setup):
     # Put the isolated vacancy inside the injected H distribution so this
     # configuration tests capture/detrapping. It remains a fixed vacancy;
     # the solver's least-resistance through-channel may still route around it.
-    z_fraction = SOURCE_Z_FRACTION.get(setup.get("boundary", "surface_return"), 0.23)
-    center = np.asarray([0.5 * nx * a, 0.5 * ny * a, z_fraction * nz * a])
+    custom_position = setup.get("injection_position_fractional") or {}
+    if custom_position:
+        center = np.asarray([custom_position[axis] for axis in ("x", "y", "z")], dtype=float) * a
+    else:
+        z_fraction = SOURCE_Z_FRACTION.get(setup.get("boundary", "surface_return"), 0.23)
+        center = np.asarray([0.5 * nx * a, 0.5 * ny * a, z_fraction * nz * a])
     index = int(np.argmin(np.linalg.norm(host_pts - center, axis=1)))
     return host_pts[index:index + 1]
 
@@ -335,6 +347,23 @@ def solve_mfpt(system, start):
     if not math.isfinite(mfpt) or mfpt <= 0:
         mfpt = 1e-12
     return mfpt
+
+
+def vacancy_capture_committor(system, mobile_site_count):
+    """Per-site probability of reaching a vacancy trap before either exit boundary."""
+    n_mobile = int(mobile_site_count)
+    n_total = system["A"].shape[0]
+    committor = np.zeros(n_total, dtype=float)
+    if n_mobile >= n_total:
+        return committor
+    committor[n_mobile:] = 1.0
+    A_mobile = system["A"][:n_mobile, :n_mobile].tocsc()
+    rates_to_trap = np.asarray(system["W"][:n_mobile, n_mobile:].sum(axis=1)).ravel()
+    try:
+        committor[:n_mobile] = np.clip(splu(A_mobile).solve(rates_to_trap), 0.0, 1.0)
+    except Exception:
+        pass
+    return committor
 
 
 def survival_outputs(system, start, mfpt, npts=80, force_approx=False):
@@ -518,6 +547,8 @@ def run_simulation(setup: Dict[str, Any], energies_eV: Dict[str, float]) -> Dict
                           mobile_site_count=len(base_sites))
     start = source_distribution(sites, setup, mobile_site_count=len(base_sites))
     fp = solve_first_passage(system, start)
+    capture_committor = vacancy_capture_committor(system, len(base_sites))
+    vacancy_capture_probability = float(np.clip(start @ capture_committor, 0.0, 1.0))
     times, S, S_map, survival_output_method = survival_outputs(
         system, start, fp["mfpt"], force_approx=bool(len(vacancy_traps))
     )
@@ -552,6 +583,9 @@ def run_simulation(setup: Dict[str, Any], energies_eV: Dict[str, float]) -> Dict
     ch_e = path_barriers(system, channel)
     ch_node_c = (np.r_[ch_e[:1], ch_e] if len(ch_e) else np.zeros(len(ch_pts))).tolist()
     y0 = float(np.median(ch_pts[:, 1])) if len(ch_pts) else 0.5 * ny * a
+    capture_slice = in_slice(sites[:len(base_sites)], y0, a, 0.9)
+    capture_sites = sites[:len(base_sites)][capture_slice]
+    capture_values = capture_committor[:len(base_sites)][capture_slice]
 
     # --- residence-weighted trap fraction ---
     res = fp["residence"]; total_res = float(res.sum()) if res.sum() > 0 else 1.0
@@ -597,6 +631,7 @@ def run_simulation(setup: Dict[str, Any], energies_eV: Dict[str, float]) -> Dict
             "path_tortuosity": tortuosity,
             "pathway_energy_cost_eV": mean_barrier,
             "trap_residence_fraction": max(0.0, min(1.0, trap_frac)),
+            "vacancy_capture_probability_before_exit": vacancy_capture_probability,
             "percolation_accessibility_fraction": float(np.mean(ea <= E0 + 0.05)) if len(ea) else 0.0,
             "retention_factor_vs_host": retention,
         },
@@ -606,6 +641,7 @@ def run_simulation(setup: Dict[str, Any], energies_eV: Dict[str, float]) -> Dict
         "interstitial_sites": xz(sites[hs_i], a),
         "vacancy_positions": xz(vacancy_positions[in_slice(vacancy_positions, y0, a, 0.9)], a),
         "vacancy_trap_points": xz(vacancy_traps[in_slice(vacancy_traps, y0, a, 0.9)], a),
+        "vacancy_capture_map": {**xz(capture_sites, a), "probability": capture_values.tolist()},
         "solute_positions": solute_out,
         "trap_sites": xz(sites[trap_i], a),
         "high_barrier_edges": xz(mids[high_i], a),
@@ -625,6 +661,7 @@ def run_simulation(setup: Dict[str, Any], energies_eV: Dict[str, float]) -> Dict
             "bottleneck_index": int(np.argmax(ch_e) + 1) if len(ch_e) else 0,
             "injection_index": int(junction),
             "channel_crosses_vacancy_trap": bool(len(vacancy_traps) and any(i >= len(base_sites) for i in channel)),
+            "dominant_route_crosses_vacancy_trap": bool(len(vacancy_traps) and any(i >= len(base_sites) for i in path)),
         },
         # ---- plot (c): global survival probability ----
         "survival_probability": {"time_s": times.tolist(), "S_t": np.asarray(S).tolist(), "mfpt_s": fp["mfpt"]},

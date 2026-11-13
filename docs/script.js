@@ -441,6 +441,7 @@ function renderResults(result) {
   renderPathPlot(result);
   renderBarrierPlot(result);
   updateVacancyProfileOutcome(result);
+  renderVacancyCaptureMap(result);
   renderSurvivalPlot(result);
   renderSurvivalMapPlot(result);
 }
@@ -452,13 +453,41 @@ function updateVacancyProfileOutcome(result) {
     box.hidden = true;
     return;
   }
-  const fraction = result.metrics?.trap_residence_fraction;
-  if (!Number.isFinite(fraction)) {
+  const capture = result.metrics?.vacancy_capture_probability_before_exit;
+  if (!Number.isFinite(capture)) {
     box.hidden = true;
     return;
   }
   box.hidden = false;
-  box.textContent = `This run: ${formatValue(100 * fraction)}% of calculated residence time was in vacancy trap states. This is a residence-time fraction, not a capture probability.`;
+  const routeHitsTrap = result.barrier_profile?.dominant_route_crosses_vacancy_trap;
+  const routeText = routeHitsTrap ? "The dominant minimum-resistance route passes through the vacancy trap." : "The dominant minimum-resistance route avoids the vacancy trap.";
+  box.textContent = `For the selected H injection site: calculated probability of reaching the vacancy before either boundary is ${formatValue(100 * capture)}%. ${routeText}`;
+}
+
+function renderVacancyCaptureMap(result) {
+  const el = document.getElementById("vacancyCapturePlot");
+  if (!el) return;
+  if (!result.vacancy_configuration?.enabled) {
+    Plotly.purge(el);
+    return;
+  }
+  const m = result.vacancy_capture_map || {x: [], z: [], probability: []};
+  const traces = [{
+    x: m.x || [], y: m.z || [], mode: "markers", type: "scattergl", name: "P(capture before exit)",
+    marker: {size: 8, color: m.probability || [], colorscale: "Viridis", cmin: 0, cmax: 1,
+      colorbar: {title: "P(capture<br>before exit)"}, symbol: "circle"},
+    customdata: m.probability || [], hovertemplate: "x/a=%{x:.2f}<br>z/a=%{y:.2f}<br>P(capture before exit)=%{customdata:.1%}<extra></extra>"
+  }];
+  const trap = result.vacancy_trap_points || {x: [], z: []};
+  if (trap.x?.length) traces.push({x: trap.x, y: trap.z, mode: "markers", type: "scatter", name: "Vacancy trap", marker: {size: 14, color: "#a855f7", symbol: "diamond", line: {width: 1, color: "#111"}}});
+  const path = result.dominant_pathway || {};
+  const inj = Number.isInteger(path.injection_index) ? path.injection_index : -1;
+  if (inj >= 0 && inj < (path.x || []).length) traces.push({x: [path.x[inj]], y: [path.z[inj]], mode: "markers", type: "scatter", name: "Injection site", marker: {size: 15, color: "#fde047", symbol: "star", line: {width: 1, color: "#111"}}});
+  Plotly.newPlot(el, traces, {
+    title: "H capture probability across the injection-region lattice slice",
+    xaxis: {title: "x / a"}, yaxis: {title: "depth z / a", autorange: "reversed"},
+    legend: {orientation: "h"}, margin: {l: 65, r: 45, t: 55, b: 65}
+  }, {responsive: true});
 }
 
 function isFiniteArray(arr) { return Array.isArray(arr) && arr.length > 0 && arr.every(v => Number.isFinite(v)); }

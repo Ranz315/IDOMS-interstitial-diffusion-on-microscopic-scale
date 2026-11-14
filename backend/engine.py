@@ -255,22 +255,23 @@ def place_vacancies(host_pts, setup):
         raise ValueError("The paper-supported vacancy model includes exactly one isolated monovacancy.")
     nx, ny, nz = setup["domain"]["Nx"], setup["domain"]["Ny"], setup["domain"]["Nz"]
     a = float(setup["lattice_parameter_A"])
-    # Put the isolated vacancy inside the injected H distribution so this
-    # configuration tests capture/detrapping. It remains a fixed vacancy;
-    # the solver's least-resistance through-channel may still route around it.
-    custom_position = setup.get("injection_position_fractional") or {}
-    if custom_position:
-        center = np.asarray([custom_position[axis] for axis in ("x", "y", "z")], dtype=float) * a
-    else:
-        z_fraction = SOURCE_Z_FRACTION.get(setup.get("boundary", "surface_return"), 0.23)
-        center = np.asarray([0.5 * nx * a, 0.5 * ny * a, z_fraction * nz * a])
+    requested = setup.get("vacancy_position_fractional") or {}
+    axes = ("x", "y", "z")
+    if any(axis not in requested for axis in axes):
+        raise ValueError("Set independent vacancy coordinates x/a, y/a, and z/a when a vacancy is enabled.")
+    fractional = np.asarray([requested[axis] for axis in axes], dtype=float)
+    limits = np.asarray([nx, ny, nz], dtype=float)
+    if not np.all(np.isfinite(fractional)) or np.any(fractional < 0) or np.any(fractional > limits):
+        raise ValueError("Vacancy coordinates must be finite and inside the simulation domain.")
+    # Snap the independent user-specified coordinate to the nearest host atom.
+    center = fractional * a
     index = int(np.argmin(np.linalg.norm(host_pts - center, axis=1)))
     return host_pts[index:index + 1]
 
 
 def add_w_vacancy_traps(base_sites, base_edges, base_mids, vacancy_positions,
-                        octa_sites, energies):
-    """Add the paper's single-H W monovacancy Oh trap and Td escape links."""
+                        octa_sites, energies, lattice_parameter_A):
+    """Add a single-H W monovacancy trap near the paper's inner-surface O-site."""
     if len(vacancy_positions) == 0:
         return base_sites, base_edges, base_mids, {}, np.empty((0, 3), dtype=float)
 
@@ -290,7 +291,11 @@ def add_w_vacancy_traps(base_sites, base_edges, base_mids, vacancy_positions,
     edge_rates = {}
     for vacancy in vacancy_positions:
         _, octa_index = octa_tree.query(vacancy, k=1)
-        trap = octa_sites[int(octa_index)]
+        trap = octa_sites[int(octa_index)].copy()
+        # Ohsawa et al. report the one-H position shifted about 0.05d along
+        # [100] or [010] from the O-site; use +[100] as one symmetry-equivalent
+        # representative. Their d is the W lattice constant.
+        trap[0] += 0.05 * float(lattice_parameter_A)
         if any(np.linalg.norm(trap - old) < 1e-8 for old in trap_positions):
             raise ValueError("Two vacancies map to the same paper-defined octahedral trap site; this overlapping configuration is unsupported.")
         trap_positions.append(trap)
@@ -328,11 +333,10 @@ def solve_first_passage(system, start):
         res = np.maximum(factor.solve(start, trans="T"), 0.0)
         mfpt = float(start @ tabs)
         psurf = float(start @ qsurf); pbulk = 1.0 - psurf
-    except Exception:
-        qsurf = np.full(A.shape[0], 0.5); tabs = np.ones(A.shape[0]) * 1e-9; res = start.copy()
-        mfpt = 1e-9; psurf = 0.5; pbulk = 0.5
+    except Exception as exc:
+        raise RuntimeError("First-passage solve failed; no probabilities or times were produced.") from exc
     if not math.isfinite(mfpt) or mfpt <= 0:
-        mfpt = 1e-12
+        raise RuntimeError("First-passage solve returned a non-positive or non-finite mean time.")
     return {"q_surface": qsurf, "t_abs": tabs, "residence": res, "mfpt": mfpt,
             "p_surface": max(0.0, min(1.0, psurf)), "p_bulk": max(0.0, min(1.0, pbulk))}
 
@@ -342,10 +346,10 @@ def solve_mfpt(system, start):
     try:
         tabs = np.maximum(spsolve(A, np.ones(A.shape[0])), 0.0)
         mfpt = float(start @ tabs)
-    except Exception:
-        mfpt = 1e-9
+    except Exception as exc:
+        raise RuntimeError("Reference-host first-passage solve failed.") from exc
     if not math.isfinite(mfpt) or mfpt <= 0:
-        mfpt = 1e-12
+        raise RuntimeError("Reference-host solve returned a non-positive or non-finite mean time.")
     return mfpt
 
 
@@ -361,8 +365,8 @@ def vacancy_capture_committor(system, mobile_site_count):
     rates_to_trap = np.asarray(system["W"][:n_mobile, n_mobile:].sum(axis=1)).ravel()
     try:
         committor[:n_mobile] = np.clip(splu(A_mobile).solve(rates_to_trap), 0.0, 1.0)
-    except Exception:
-        pass
+    except Exception as exc:
+        raise RuntimeError("Vacancy-capture probability solve failed; no capture probability was produced.") from exc
     return committor
 
 
@@ -523,7 +527,7 @@ def run_simulation(setup: Dict[str, Any], energies_eV: Dict[str, float]) -> Dict
     vacancy_positions = place_vacancies(host, setup)
     if len(vacancy_positions):
         sites, edges, mids, special_edge_rates, vacancy_traps = add_w_vacancy_traps(
-            base_sites, base_edges, base_mids, vacancy_positions, octa, energies_eV
+            base_sites, base_edges, base_mids, vacancy_positions, octa, energies_eV, a
         )
         remaining = np.ones(len(host), dtype=bool)
         host_tree = cKDTree(host)
@@ -674,6 +678,13 @@ def run_simulation(setup: Dict[str, Any], energies_eV: Dict[str, float]) -> Dict
             "enabled": bool(len(vacancy_positions)),
             "requested_vacancy_count": vacancy_count_requested,
             "placed_vacancy_count": int(len(vacancy_positions)),
+            "injection_source_kind": ("nearest interstitial site to requested coordinate" if setup.get("injection_position_fractional") else "peak site of automatic source distribution"),
+            "effective_injection_position_fractional": {"x": float(sites[source_idx, 0] / a), "y": float(sites[source_idx, 1] / a), "z": float(sites[source_idx, 2] / a)},
+            "requested_position_fractional": setup.get("vacancy_position_fractional", {}),
+            "placed_position_fractional": ([{"x": float(p[0] / a), "y": float(p[1] / a), "z": float(p[2] / a)} for p in vacancy_positions] if len(vacancy_positions) else []),
+            "H1_trap_position_fractional": ([{"x": float(p[0] / a), "y": float(p[1] / a), "z": float(p[2] / a)} for p in vacancy_traps] if len(vacancy_traps) else []),
+            "injection_to_vacancy_distance_A": (float(np.linalg.norm(sites[source_idx] - vacancy_positions[0])) if len(vacancy_positions) else None),
+            "injection_to_H1_trap_distance_A": (float(np.linalg.norm(sites[source_idx] - vacancy_traps[0])) if len(vacancy_traps) else None),
             "model_scope": "One fixed BCC W monovacancy trapping one dilute mobile H atom; vacancy concentration, multiple H per vacancy, and vacancy motion are not modeled." if len(vacancy_positions) else "No vacancy states.",
         },
         "notes": {
@@ -681,7 +692,7 @@ def run_simulation(setup: Dict[str, Any], energies_eV: Dict[str, float]) -> Dict
             "energy_definition": "E_act(i->j) = E_saddle(i,j) - U_i, with U_i the explicit diffusing-species site energy.",
             "channel": "Visualised pathway is the continuous minimum-resistance channel surface <-> injection <-> bulk.",
             "retention_definition": "Retention factor = tau_MFPT(alloy) / tau_MFPT(ideal host) on the same domain.",
-            "vacancy_model": ("One fixed W monovacancy is placed at the host-lattice site nearest the H injection-distribution center so injected H can encounter the trap. The model uses S7 DFT single-H binding, detrapping barrier, and attempt frequency. The minimum-resistance through-channel can still route around this side trap. Vacancy concentration, multi-H occupancy, vacancy migration, and vacancy clusters are not modeled." if len(vacancy_positions) else "No vacancy sites were included."),
+            "vacancy_model": ("One fixed W monovacancy is placed at the nearest host-lattice site to the separately specified vacancy coordinates. Its H1 trap is represented near the nearest octahedral inner-surface site, displaced by 0.05 lattice parameters along +[100], one symmetry-equivalent direction reported by Ohsawa et al. S7 DFT supplies the single-H kinetic parameters. Vacancy location is independent of H injection. The minimum-resistance through-channel can still route around this side trap. Vacancy concentration, multi-H occupancy, vacancy migration, and vacancy clusters are not modeled." if len(vacancy_positions) else "No vacancy sites were included."),
         },
     }
     return json_safe(result)

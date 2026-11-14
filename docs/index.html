@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>IDOMS — Interstitial Diffusion on Microscopic Scale</title>
-  <link rel="stylesheet" href="style.css?v=2026-07-05-06" />
+  <link rel="stylesheet" href="style.css?v=2026-11-14-02" />
   <style id="idoms-critical">
     /* Critical layout — inlined so the sidebar, page switching and figure
        sizing work even if an old external stylesheet is cached. */
@@ -123,9 +123,9 @@
               <label>Host element
                 <select id="hostElement"><option value="Fe">Fe (BCC iron)</option><option value="W">W (BCC tungsten)</option></select>
               </label>
-              <label>Paper-sourced lattice parameter, a (Å) <input id="latticeA" type="number" step="0.0001" readonly /></label>
+              <label>Resolved lattice parameter, a (Å) <input id="latticeA" type="number" step="0.0001" readonly /></label>
             </div>
-            <p id="latticeStatus" class="hint">The lattice parameter is calculated from the supplied papers when the selected composition is covered.</p>
+            <p id="latticeStatus" class="hint">The lattice parameter comes from a supplied paper record where available. Fe–C–Cr is marked missing unless a source provides the matching value.</p>
             <p class="hint">Select up to two alloying elements from the paper-supported list. Host at.% is calculated automatically.</p>
             <table class="composition-table">
               <thead><tr><th>Alloying element</th><th>at.%</th><th></th></tr></thead>
@@ -164,11 +164,19 @@
                 <select id="boundaryType"><option value="surface_return">Surface return vs bulk transmission</option><option value="bulk_transmission">Bulk transmission</option><option value="retention">Retention between two absorbing boundaries</option></select>
               </label>
             </div>
-            <p class="hint">Optional injection site in fractional lattice coordinates (x/a, y/a, z/a). Enter all three coordinates to place H at the nearest interstitial site; leave all blank for automatic placement. With one W vacancy, the vacancy is placed near the selected injection location.</p>
+            <p class="hint">Optional H injection site in fractional lattice coordinates (x/a, y/a, z/a). Enter all three coordinates to place H at the nearest interstitial site; leave all blank for the automatic source distribution. Vacancy coordinates are entered separately below.</p>
             <div class="grid three">
               <label>Injection x/a <input id="injectionX" type="number" min="0" step="0.25" placeholder="Auto" /></label>
               <label>Injection y/a <input id="injectionY" type="number" min="0" step="0.25" placeholder="Auto" /></label>
               <label>Injection z/a <input id="injectionZ" type="number" min="0" step="0.25" placeholder="Auto" /></label>
+            </div>
+            <div id="vacancyPositionControls" hidden>
+              <p class="hint"><strong>Independent vacancy position.</strong> Enter all three fractional coordinates (x/a, y/a, z/a). This position does not move when you change the H injection point; the vacancy is placed at the nearest W lattice site.</p>
+              <div class="grid three">
+                <label>Vacancy x/a <input id="vacancyX" type="number" min="0" step="0.25" placeholder="Required" /></label>
+                <label>Vacancy y/a <input id="vacancyY" type="number" min="0" step="0.25" placeholder="Required" /></label>
+                <label>Vacancy z/a <input id="vacancyZ" type="number" min="0" step="0.25" placeholder="Required" /></label>
+              </div>
             </div>
             <button onclick="prepareEnergyInputs()">Calculate domain and look up paper values</button>
             <div id="domainSummary" class="summary"></div>
@@ -199,6 +207,7 @@
             <h2>6. Lattice-aware minimum-resistance channel</h2>
             <p class="hint">Continuous surface ↔ injection ↔ bulk channel through a thin lattice y-slice, coloured by local activation barrier.</p>
             <div id="pathPlot" class="plot"></div>
+            <p id="vacancyGeometryHint" class="hint" hidden>The X marks the missing W atom. The diamond marks the modeled H₁ position near the vacancy’s inner-surface octahedral site. Ohsawa et al. report a shift of about 0.05d from that O-site; the model displays one symmetry-equivalent +[100] orientation. The dotted connector is a geometric reference, not an H jump path.</p>
           </section>
 
           <section class="card">
@@ -209,11 +218,22 @@
 
           <section id="vacancyEnergyCard" class="card" hidden>
             <h2>8. Run-specific H-vacancy capture probability</h2>
-            <p class="hint">Calculated probability that H starting at each interstitial site reaches the vacancy before exiting through either boundary. The map responds to the injection position and vacancy placement; it is a kinetic-model result based on the resolved paper values.</p>
+            <p class="hint">The large percentage is the result for your selected injection site. Darker sites indicate higher capture probability; the calculation uses the resolved paper values.</p>
             <div id="vacancyEnergyNote" class="hint"></div>
-            <div id="vacancyRunOutcome" class="summary compact" hidden></div>
-            <div id="vacancyCapturePlot" class="plot small"></div>
-            <p class="hint">Paper-value reference: the intrinsic S7 single-H capture and detrapping energy path below applies once H reaches the vacancy, so its energy levels do not vary with injection position.</p>
+            <div id="vacancyRunOutcome" class="capture-outcome" hidden></div>
+            <div id="vacancyCapturePlot" class="plot"></div>
+            <p class="hint">The color scale is stretched to the 95th-percentile capture probability in this slice. Higher values use the darkest shade; hover over a site for its exact probability.</p>
+            <h3>Occupancy-dependent vacancy energetics</h3>
+            <p class="hint">Paper-derived occupancy energetics are shown here as reference data. They are not an output of the spatial transport solver and are not presented as validation of it.</p>
+            <div class="grid two">
+              <label>Vacancy occupancy, j
+                <select id="vacancyOccupancySelect"></select>
+              </label>
+              <label>Energy data
+                <select id="vacancyEnergyBasis"><option value="DFT">DFT</option><option value="ZPE">ZPE corrected</option></select>
+              </label>
+            </div>
+            <p id="vacancyOccupancyNote" class="hint"></p>
             <div id="vacancyEnergyPlot" class="plot small"></div>
           </section>
 
@@ -543,6 +563,6 @@
     </div>
   </div>
 
-  <script src="script.js?v=2026-11-13-01"></script>
+  <script src="script.js?v=2026-11-14-05"></script>
 </body>
 </html>

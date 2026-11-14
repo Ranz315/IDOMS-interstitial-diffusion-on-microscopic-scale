@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 import math
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -36,11 +37,11 @@ PAPER_RUNTIME_VALUES = {
         "pristine_doi": "10.1063/1.3386515",
         "pristine_paper_location": "PDF p. 5, Table I; calculated W lattice constant, this work",
         "pristine_verification": "Value transcribed from the Table I row and cross-checked against the paper's statement comparing its calculated value with experimental 3.165 Å.",
-        "vacancy_value_A": 3.165,
+        "vacancy_value_A": 3.187,
         "vacancy_source_id": "S7",
         "vacancy_doi": "10.1016/j.actamat.2015.04.052",
-        "vacancy_paper_location": "PDF p. 2; experimental W lattice parameter used in the calculations",
-        "vacancy_verification": "Value checked in the Methods passage and against the fixed-cell description for vacancy calculations.",
+        "vacancy_paper_location": "PDF p. 2; optimized BCC cell parameter, with vacancy calculations later performed at fixed cell parameter",
+        "vacancy_verification": "Methods reports a = 3.187 Å as the optimized cell parameter; the 3.165 Å value in the same passage is explicitly the experimental comparison. Section 3.3 says the vacancy-cell parameter was fixed.",
     },
     "w_vacancy_h1_attempt_frequency": {
         "value_Hz": 0.85e13,
@@ -48,6 +49,20 @@ PAPER_RUNTIME_VALUES = {
         "doi": "10.1016/j.actamat.2015.04.052",
         "paper_location": "PDF p. 7 (printed p. 313); attempt frequencies for vacancy occupancy j=1..6",
         "verification": "The j=1 value is transcribed from the explicit frequency list and checked against the paper's definition of the occupancy-specific attempt frequency in Eq. (24).",
+    },
+    "w_vacancy_attempt_frequencies": {
+        "values_Hz": [0.85e13, 0.83e13, 1.45e13, 0.99e13, 1.07e13, 0.98e13],
+        "source_id": "S7",
+        "doi": "10.1016/j.actamat.2015.04.052",
+        "paper_location": "PDF p. 7 (printed p. 313); Eq. (24), mean frequencies for j=1..6 over 300–1000 K",
+        "verification": "All six values transcribed from the explicit ordered list in the paper and matched to j=1..6; values are means over 300–1000 K, not temperature-specific frequencies.",
+    },
+    "w_vacancy_initial_population": {
+        "relative_to_vh6": [5.74e-37, 2.05e-25, 1.01e-16, 1.83e-8, 2.69e-2, 1.0],
+        "source_id": "S7",
+        "doi": "10.1016/j.actamat.2015.04.052",
+        "paper_location": "PDF p. 9 (printed p. 315), Table 5; x_H=10^-5 H/W, T=300 K; x_VHj normalized to VH6",
+        "verification": "Values transcribed from the normalized x_VHj row and independently checked by dividing the Table 5 x_j values by the VH6 value (1.63e-6). These are model-calculated starting populations, not measured occupancies.",
     },
 }
 
@@ -134,6 +149,85 @@ def _paper_record(key: str, value: Optional[float], unit: str, *, source_id: str
     }
 
 
+@lru_cache(maxsize=128)
+def _tcfe15_bcc_lattice_parameter_cached(
+    cr_at_percent: float, c_at_percent: float, temperature_K: float,
+) -> tuple[Optional[float], Dict[str, Any]]:
+    """Calculate a constrained single-phase BCC lattice parameter through TC-Python.
+
+    TCFE15 is proprietary and is deliberately neither included nor emulated here.
+    The result is obtained only from the user's licensed Thermo-Calc installation.
+    """
+    database = os.environ.get("IDOMS_TCFE_DATABASE", "TCFE15").strip()
+    try:
+        from tc_python import TCPython, ThermodynamicQuantity
+    except (ImportError, OSError) as exc:
+        return None, {
+            "status": "MISSING_EXTERNAL_LICENSED_DATABASE",
+            "database": database,
+            "reason": "Fe–Cr–C lattice parameter requires Thermo-Calc TCFE15 and TC-Python in the backend Python environment. Neither is bundled with IDOMS.",
+            "detail": str(exc),
+        }
+
+    elements = ["Fe", "C"] + (["Cr"] if cr_at_percent > 0 else [])
+    try:
+        with TCPython() as session:
+            available = session.get_databases()
+            if database not in available:
+                return None, {
+                    "status": "MISSING_EXTERNAL_LICENSED_DATABASE",
+                    "database": database,
+                    "reason": f"Thermo-Calc does not report {database} as available in this installation. Check the database name and license.",
+                }
+            calc = (session.select_database_and_elements(database, elements)
+                    .get_system().with_single_equilibrium_calculation())
+            calc.set_phase_to_suspended("ALL_PHASES")
+            calc.set_phase_to_entered("BCC_A2")
+            calc.set_condition(ThermodynamicQuantity.temperature(), temperature_K)
+            if cr_at_percent > 0:
+                calc.set_condition(
+                    ThermodynamicQuantity.mole_fraction_of_a_component("Cr"),
+                    cr_at_percent / 100.0,
+                )
+            calc.set_condition(
+                ThermodynamicQuantity.mole_fraction_of_a_component("C"),
+                c_at_percent / 100.0,
+            )
+            result = calc.calculate()
+            molar_volume_m3_mol = float(result.get_value_of(
+                ThermodynamicQuantity.molar_volume_of_phase("BCC_A2")
+            ))
+            # TCFE's molar volume is per mole of BCC lattice sites; a BCC cell
+            # contains two lattice sites. Convert m^3/mol to cubic-cell edge Å.
+            avogadro = 6.02214076e23
+            lattice_a_A = (2.0 * molar_volume_m3_mol / avogadro) ** (1.0 / 3.0) * 1e10
+            if not math.isfinite(lattice_a_A) or lattice_a_A <= 0:
+                return None, {
+                    "status": "TCFE_CALCULATION_FAILED", "database": database,
+                    "reason": "TCFE15 returned a nonphysical BCC_A2 molar volume.",
+                    "molar_volume_m3_mol": molar_volume_m3_mol,
+                }
+            return lattice_a_A, {
+                "status": "TCFE_CALCULATED",
+                "database": database,
+                "database_version": database,
+                "method": "TC-Python constrained single-phase BCC_A2; lattice parameter derived from TCFE molar volume and two BCC lattice sites per cubic cell.",
+                "molar_volume_m3_mol": molar_volume_m3_mol,
+                "temperature_K": temperature_K,
+                "cr_at_percent": cr_at_percent,
+                "c_at_percent": c_at_percent,
+                "unit": "Å",
+                "mapping_or_limit": "CALPHAD database calculation, not a paper-reported value. Other phases were suspended to obtain the homogeneous BCC_A2 matrix lattice parameter at the nominal input composition; precipitation/microstructure partitioning is not modeled by this lattice calculation.",
+            }
+    except Exception as exc:
+        return None, {
+            "status": "TCFE_CALCULATION_FAILED",
+            "database": database,
+            "reason": "The TCFE15 BCC_A2 lattice calculation failed. Confirm the TC-Python/Thermo-Calc versions, TCFE license, and that BCC_A2 supports the entered Fe–Cr–C composition at this temperature.",
+            "detail": str(exc),
+        }
+
+
 def _paper_lattice_parameter(setup: Dict[str, Any]) -> tuple[Optional[float], Dict[str, Any]]:
     host = str(setup.get("host", "")).strip()
     structure = str(setup.get("crystal_structure", "")).strip().upper()
@@ -142,14 +236,25 @@ def _paper_lattice_parameter(setup: Dict[str, Any]) -> tuple[Optional[float], Di
     if structure != "BCC":
         return None, {"reason": "The supplied lattice-parameter records apply to BCC crystals only."}
     if host == "Fe":
-        unsupported = {el: pct for el, pct in composition.items() if pct > 0 and el != "Cr"}
+        if any(not math.isfinite(pct) or pct < 0 for pct in composition.values()):
+            return None, {"reason": "Alloying-element atomic percentages must be finite and nonnegative."}
+        if sum(composition.values()) >= 100:
+            return None, {"reason": "Total alloying content must be less than 100 at.%."}
+        c_fraction = composition.get("C", 0.0)
+        cr_fraction = composition.get("Cr", 0.0)
+        unsupported = {el: pct for el, pct in composition.items()
+                       if pct > 0 and el not in {"C", "Cr"}}
         if unsupported:
             return None, {
-                "reason": "The supplied papers do not report a composition-dependent BCC Fe lattice parameter for this alloying element set.",
+                "reason": "TCFE15 integration currently supports only Fe–Cr–C BCC compositions.",
                 "unsupported_elements": sorted(unsupported),
             }
+        if c_fraction > 0:
+            return _tcfe15_bcc_lattice_parameter_cached(
+                cr_fraction, c_fraction, float(setup.get("temperature_K", 298.15))
+            )
         data = PAPER_RUNTIME_VALUES["fe_cr_lattice"]
-        cr_fraction = composition.get("Cr", 0.0) / 100.0
+        cr_fraction = cr_fraction / 100.0
         if not 0.0 <= cr_fraction <= 1.0:
             return None, {"reason": "Cr composition must be between 0 and 100 at.%."}
         value = data["Fe_A"] + cr_fraction * (data["Cr_A"] - data["Fe_A"])
@@ -172,10 +277,66 @@ def _paper_lattice_parameter(setup: Dict[str, Any]) -> tuple[Optional[float], Di
             "doi": data[f"{prefix}_doi"],
             "paper_location": data[f"{prefix}_paper_location"],
             "verification": data[f"{prefix}_verification"],
-            "mapping_or_limit": ("Experimental W lattice parameter used by S7 for vacancy calculations." if vacancy_enabled
+            "mapping_or_limit": ("S7 optimized DFT cell parameter used for its fixed-cell vacancy calculations. This is a source-model cell setting, not a claim that one vacancy changes the bulk lattice parameter." if vacancy_enabled
                                  else "Calculated pristine W lattice parameter from S4; the experimental comparator is 3.165 Å."),
         }
     return None, {"reason": "No paper-supported lattice parameter is available for this host/composition."}
+
+
+def _w_vacancy_occupancy_profiles(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Build occupancy profiles only from the matching S7 workbook rows."""
+    frequency_data = PAPER_RUNTIME_VALUES["w_vacancy_attempt_frequencies"]
+    frequency_by_occupancy = {
+        j: frequency_data["values_Hz"][j - 1]
+        for j in range(1, len(frequency_data["values_Hz"]) + 1)
+    }
+
+    def find(parameter: str, occupancy: int) -> Optional[Dict[str, Any]]:
+        expected_configuration = f"{occupancy} H atoms in vacancy"
+        return next((row for row in records
+                     if row.get("Source ID") == "S7"
+                     and row.get("Host") == "W"
+                     and row.get("Phase") == "bcc W"
+                     and row.get("Interstitial") == "H"
+                     and row.get("Parameter") == parameter
+                     and str(row.get("Configuration", "")).strip() == expected_configuration
+                     and row.get("Status") == "PAPER_REPORTED"
+                     and row.get("Unit") == "eV"
+                     and isinstance(row.get("Numeric value"), (int, float))
+                     and math.isfinite(float(row["Numeric value"]))), None)
+
+    profiles: List[Dict[str, Any]] = []
+    for occupancy in range(1, 13):
+        binding_dft = find("Incremental H binding e_b,j (DFT)", occupancy)
+        binding_zpe = find("Incremental H binding e_b,j (ZPE corrected)", occupancy)
+        detrap_dft = find("De-trapping barrier (DFT)", occupancy)
+        detrap_zpe = find("De-trapping barrier (ZPE corrected)", occupancy)
+
+        def value(row: Optional[Dict[str, Any]]) -> Optional[float]:
+            return float(row["Numeric value"]) if row else None
+
+        b_dft, b_zpe = value(binding_dft), value(binding_zpe)
+        d_dft, d_zpe = value(detrap_dft), value(detrap_zpe)
+        nu = frequency_by_occupancy.get(occupancy)
+        profiles.append({
+            "occupancy_j": occupancy,
+            "binding_DFT_eV": b_dft,
+            "binding_ZPE_eV": b_zpe,
+            "detrapping_DFT_eV": d_dft,
+            "detrapping_ZPE_eV": d_zpe,
+            "capture_saddle_DFT_eV": (b_dft + d_dft) if b_dft is not None and d_dft is not None else None,
+            "capture_saddle_ZPE_eV": (b_zpe + d_zpe) if b_zpe is not None and d_zpe is not None else None,
+            "attempt_frequency_Hz": nu,
+            "attempt_frequency_source": (frequency_data if nu is not None else None),
+            "energy_source": "S7 Table 3/Table 4; printed pp. 312–313",
+        })
+    return profiles
+
+
+def resolve_lattice_parameter(setup: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve the lattice parameter before the frontend constructs its domain."""
+    value, record = _paper_lattice_parameter(setup)
+    return {"lattice_parameter_A": value, "lattice_parameter_resolution": record}
 
 
 def resolve_energy_inputs(setup: Dict[str, Any]) -> Dict[str, Any]:
@@ -197,6 +358,10 @@ def resolve_energy_inputs(setup: Dict[str, Any]) -> Dict[str, Any]:
     missing: List[Dict[str, str]] = []
 
     lattice_a, lattice_record = _paper_lattice_parameter(setup)
+    occupancy_profiles = (
+        _w_vacancy_occupancy_profiles(records)
+        if host == "W" and structure == "BCC" and species == "H" else []
+    )
     if lattice_a is None:
         values.append({"key": "lattice_parameter_A", "value": None,
                        "unit": "Å", "status": "MISSING",
@@ -345,6 +510,7 @@ def resolve_energy_inputs(setup: Dict[str, Any]) -> Dict[str, Any]:
         "runnable": not missing,
         "resolved_energies_eV": resolved,
         "resolved_vacancy_parameters": vacancy_parameters,
+        "w_vacancy_occupancy_profiles": occupancy_profiles,
         "lattice_parameter_A": lattice_a,
         "lattice_parameter_resolution": lattice_record,
         "values": values,

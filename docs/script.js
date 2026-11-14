@@ -1,6 +1,6 @@
 const DEFAULT_BACKEND_URL = ["localhost", "127.0.0.1"].includes(window.location.hostname)
   ? "http://localhost:8001"
-  : "https://idoms-backend.onrender.com";
+  : "https://idoms-interstitial-diffusion-on.onrender.com";
 const MAX_ALLOY_ELEMENTS = 2;
 const MIN_ATOMS_PER_ALLOY = 4;
 const MIN_NX_NY = 5;

@@ -9,10 +9,11 @@ from energetics import (
     EnergeticsDatabaseError,
     load_energy_records,
     resolve_energy_inputs,
+    resolve_lattice_parameter,
 )
 
 
-VERSION = "0.5-paper-lattice-and-vacancy"
+VERSION = "1.0-tcfe15-lattice"
 
 app = FastAPI(title="IDOMS Two-Alloy Backend", version=VERSION)
 
@@ -44,6 +45,8 @@ class ToolSetup(BaseModel):
     crystal_structure: Literal["BCC", "FCC"]
     lattice_parameter_A: float
     vacancy_count: Literal[0, 1] = 0
+    injection_position_fractional: Dict[str, float] = Field(default_factory=dict)
+    vacancy_position_fractional: Dict[str, float] = Field(default_factory=dict)
     interstitial_species: Literal["H", "D", "T", "C", "N", "O"]
     site_network: Literal["auto", "tetrahedral", "octahedral", "tetra_octa"] = "auto"
     temperature_K: float
@@ -55,6 +58,14 @@ class ToolSetup(BaseModel):
 
 class SimulationInput(BaseModel):
     setup: ToolSetup
+
+
+class LatticeInput(BaseModel):
+    host: str
+    composition_at_percent: Dict[str, float] = Field(default_factory=dict)
+    crystal_structure: Literal["BCC", "FCC"]
+    temperature_K: float = Field(gt=0)
+    vacancy_count: Literal[0, 1] = 0
 
 
 @app.get("/health")
@@ -80,6 +91,12 @@ def resolve_energies(inp: SimulationInput):
         return resolve_energy_inputs(inp.setup.model_dump())
     except EnergeticsDatabaseError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/resolve-lattice")
+def resolve_lattice(inp: LatticeInput):
+    """Resolve the lattice parameter before frontend domain sizing."""
+    return resolve_lattice_parameter(inp.model_dump())
 
 
 @app.post("/simulate")
@@ -109,7 +126,11 @@ def simulate(inp: SimulationInput):
     simulation_energies = dict(resolution["resolved_energies_eV"])
     simulation_energies.update(resolution.get("resolved_vacancy_parameters", {}))
 
-    result = run_simulation(setup, simulation_energies)
-    result["paper_lattice_parameter_A"] = resolution["lattice_parameter_A"]
+    try:
+        result = run_simulation(setup, simulation_energies)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    result["resolved_lattice_parameter_A"] = resolution["lattice_parameter_A"]
+    result["lattice_parameter_resolution"] = resolution["lattice_parameter_resolution"]
     result["energy_resolution"] = resolution
     return result
